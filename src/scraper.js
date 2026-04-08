@@ -12,7 +12,7 @@ const tweetCache   = new TTLCache();
 const trendsCache  = new TTLCache();
 
 const TWEET_CACHE_TTL   = 30_000;              // 30 seconds
-const PROFILE_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours (prevents rate limits on avatars)
+const PROFILE_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 const TRENDS_CACHE_TTL  = 5 * 60_000;          // 5 minutes
 
 // ─── Scraper state ───────────────────────────────────────────────────────────
@@ -69,9 +69,8 @@ export async function initScraper() {
       if (ready) {
         console.log('✅ Twitter session active — scraper is ready');
         
-        // 🔥 START THE BACKGROUND WORKER HERE 🔥
         runBackgroundFirehose();
-        // FIX: Increased to 60 seconds to prevent 503 Rate Limit bans from Twitter
+        // Set to 60 seconds to prevent 503 Rate Limit errors from Twitter
         setInterval(runBackgroundFirehose, 60_000); 
         
       } else {
@@ -97,7 +96,6 @@ export async function getProfile(username) {
   try {
     const p = await scraper.getProfile(username);
     
-    // Deep fallback to find the avatar in any scraper version
     const avatarUrl = p.avatar || p.profileImageUrl || p.profile_image_url_https || null;
     const followers = p.followersCount ?? p.followers_count ?? 0;
 
@@ -119,13 +117,11 @@ export async function getProfile(username) {
 // ─── Tweet helpers ────────────────────────────────────────────────────────────
 
 function formatTweet(tweet) {
-  // Standardize engagement stats
   const likes = tweet.likes ?? tweet.likeCount ?? tweet.favoriteCount ?? tweet.favorite_count ?? 0;
   const retweets = tweet.retweets ?? tweet.retweetCount ?? tweet.retweet_count ?? 0;
   const replies = tweet.replies ?? tweet.replyCount ?? tweet.reply_count ?? 0;
   const views = tweet.views ?? tweet.viewCount ?? tweet.view_count ?? 0;
 
-  // Extract deeply nested user data directly from the tweet to avoid API calls
   const user = tweet.user || tweet.author || {};
   const legacy = tweet.core?.user_results?.result?.legacy || user.legacy || {};
   const result = tweet.core?.user_results?.result || user.result || {};
@@ -177,8 +173,6 @@ function formatTweet(tweet) {
     permanentUrl: tweet.permanentUrl || (tweet.id ? `https://x.com/${tweet.username}/status/${tweet.id}` : null),
     isRetweet:    tweet.isRetweet || false,
     isReply:      tweet.isReply || false,
-    
-    // Set raw defaults first, enrichment will safely overwrite if needed
     profileImage:   embeddedAvatar,
     displayName:    embeddedName,
     followersCount: embeddedFollowers,
@@ -188,12 +182,10 @@ function formatTweet(tweet) {
 
 async function enrichTweets(tweets) {
   const usernames = [...new Set(tweets.map(t => t.username).filter(Boolean))];
-  
-  // Only fetch users that aren't already cached
   const missingUsernames = usernames.filter(u => !profileCache.has(`profile:${u.toLowerCase()}`));
   
-  // Cap at 20 fetches to dodge rate limits
-  const toFetch = missingUsernames.slice(0, 20);
+  // Cap at 10 to dodge rate limits
+  const toFetch = missingUsernames.slice(0, 10);
 
   const fetchOne = (u) =>
     Promise.race([
@@ -207,22 +199,21 @@ async function enrichTweets(tweets) {
     const p = profileCache.get(`profile:${tweet.username?.toLowerCase()}`) || {};
     return {
       ...tweet,
-      profileImage:   p.avatar         || tweet.profileImage || null,
-      displayName:    p.name           || tweet.displayName || tweet.username,
+      // 🔥 SURGICAL FIX: If the scraper fails, instantly inject a dynamic Unavatar link!
+      profileImage:   p.avatar || tweet.profileImage || `https://unavatar.io/x/${tweet.username}`,
+      displayName:    p.name || tweet.displayName || tweet.username,
       followersCount: p.followersCount ?? tweet.followersCount ?? 0,
-      isVerified:     p.isVerified     || tweet.isVerified || false,
+      isVerified:     p.isVerified || tweet.isVerified || false,
     };
   });
 }
 
 async function enrichTweetsBatched(tweets, batchSize = 5) {
   const usernames = [...new Set(tweets.map(t => t.username).filter(Boolean))];
-
-  // Only fetch users that aren't already cached
   const missingUsernames = usernames.filter(u => !profileCache.has(`profile:${u.toLowerCase()}`));
 
-  // Cap at 15 NEW profiles per cycle to dodge Twitter's shadowban
-  const toFetch = missingUsernames.slice(0, 15);
+  // Cap at 10 NEW profiles per cycle to dodge Twitter's shadowban
+  const toFetch = missingUsernames.slice(0, 10);
 
   const fetchOne = (u) =>
     Promise.race([
@@ -236,15 +227,14 @@ async function enrichTweetsBatched(tweets, batchSize = 5) {
   }
 
   return tweets.map(tweet => {
-    // Pull from our 24-hour cache safely
     const p = profileCache.get(`profile:${tweet.username?.toLowerCase()}`) || {};
     return {
       ...tweet,
-      // Fallback safely so it never hits null if the extraction caught it earlier
-      profileImage:   p.avatar         || tweet.profileImage || null,
-      displayName:    p.name           || tweet.displayName || tweet.username,
+      // 🔥 SURGICAL FIX: Never return null again, use the dynamic Unavatar resolver.
+      profileImage:   p.avatar || tweet.profileImage || `https://unavatar.io/x/${tweet.username}`,
+      displayName:    p.name || tweet.displayName || tweet.username,
       followersCount: p.followersCount ?? tweet.followersCount ?? 0,
-      isVerified:     p.isVerified     || tweet.isVerified || false,
+      isVerified:     p.isVerified || tweet.isVerified || false,
     };
   });
 }
@@ -348,7 +338,6 @@ export async function getTrendingTweets(trendCount = 20, tweetsPerTrend = 3, mod
 
 let backgroundRunning = false;
 
-// This runs silently in the background so the user never has to wait.
 async function runBackgroundFirehose() {
   if (!ready) return;
   if (backgroundRunning) {
@@ -357,8 +346,6 @@ async function runBackgroundFirehose() {
   backgroundRunning = true;
 
   try {
-    // Ensuring high quality by enforcing minimum engagement (min_faves:15)
-    // and premium accounts (filter:verified) to emulate creatememe.io tracking
     const queries = [
       '(crypto OR $SOL OR memecoin OR pump.fun OR dexscreener) filter:verified min_faves:15 -filter:replies',
       '(AI OR OpenAI OR ChatGPT OR SpaceX OR robotics) filter:verified min_faves:15 -filter:replies',
@@ -389,12 +376,10 @@ async function runBackgroundFirehose() {
       .filter(r => r.status === 'fulfilled')
       .forEach(r => allTweets.push(...r.value));
 
-    // Deduplicate by id
     const uniqueTweets = Array.from(
       new Map(allTweets.filter(t => t && t.id).map(t => [t.id, t])).values()
     );
 
-    // Keep tweets from the last hour
     const freshTweets = uniqueTweets.filter(t => {
       const tTime = t.timestamp || (t.timeParsed ? Math.floor(new Date(t.timeParsed).getTime() / 1000) : 0);
       return tTime >= oneHourAgo;
@@ -402,7 +387,6 @@ async function runBackgroundFirehose() {
 
     const finalTweets = freshTweets.length > 0 ? freshTweets : uniqueTweets;
 
-    // Sort newest first
     finalTweets.sort((a, b) => {
       const timeA = a.timestamp || (a.timeParsed ? Math.floor(new Date(a.timeParsed).getTime() / 1000) : 0);
       const timeB = b.timestamp || (b.timeParsed ? Math.floor(new Date(b.timeParsed).getTime() / 1000) : 0);
@@ -412,7 +396,6 @@ async function runBackgroundFirehose() {
     if (finalTweets.length > 0) {
       const capped = finalTweets.slice(0, 60);
 
-      // Save raw immediately 
       instantFirehoseData = capped;
 
       try {
