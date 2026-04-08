@@ -269,42 +269,65 @@ const FIREHOSE_SOURCES = [
 async function runBackgroundFirehose() {
   if (!ready) return;
 
-  console.log('🔄 Background Worker: Fetching fresh firehose tweets...');
+  console.log('🔄 Background Worker: Fetching 10-seconds-ago alpha...');
   try {
-    const uniqueSources = [...new Set(FIREHOSE_SOURCES)];
-    const chunkSize = 10;
-    const batches = [];
-    for (let i = 0; i < uniqueSources.length; i += chunkSize) {
-      batches.push(uniqueSources.slice(i, i + chunkSize));
-    }
+    // ─── THE CREATEMEME ALPHA QUERY ───
+    // We stop using massive 'from:' lists which crash the search engine.
+    // Instead, we search for the exact topics that drive the market, 
+    // restrict it to verified accounts to kill spam, and use SearchMode.Latest.
+    const queries = [
+      '(crypto OR $SOL OR memecoin OR pump.fun OR dexscreener) filter:verified -filter:replies',
+      '(AI OR OpenAI OR ChatGPT OR SpaceX OR robotics) filter:verified -filter:replies',
+      '(breaking OR alert OR "just in" OR ceasefire OR war) filter:verified filter:media -filter:replies'
+    ];
 
-    const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
     const allTweets = [];
+    const tenMinutesAgo = Math.floor(Date.now() / 1000) - 600; // STRICT 10-minute cutoff
 
-    for (const batch of batches) {
-      const fromQuery = batch.map(user => `from:${user}`).join(' OR ');
-      const query = `(${fromQuery}) filter:media -filter:replies`;
-
-      for await (const tweet of scraper.searchTweets(query, 20, SearchMode.Latest)) {
-        if (tweet.timestamp && tweet.timestamp < oneHourAgo) {
-          break; 
+    for (const query of queries) {
+      try {
+        for await (const tweet of scraper.searchTweets(query, 15, SearchMode.Latest)) {
+          const tweetTime = tweet.timestamp || (tweet.timeParsed ? Math.floor(tweet.timeParsed.getTime() / 1000) : 0);
+          
+          // HARD STOP: If a tweet is older than 10 minutes, kill the loop immediately.
+          if (tweetTime > 0 && tweetTime < tenMinutesAgo) {
+            break; 
+          }
+          
+          allTweets.push(formatTweet(tweet));
         }
-        allTweets.push(formatTweet(tweet));
+      } catch (err) {
+        console.error(`[Firehose] Error on query [${query}]:`, err.message);
       }
     }
 
+    // Deduplicate
     const uniqueTweets = Array.from(new Map(allTweets.map(t => [t.id, t])).values());
-    uniqueTweets.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-    const lastHourTweets = uniqueTweets.filter(t => t.timestamp && t.timestamp >= oneHourAgo);
+    
+    // Sort strictly by absolute newest first
+    uniqueTweets.sort((a, b) => {
+      const timeA = a.timestamp || (a.timeParsed ? Math.floor(a.timeParsed.getTime() / 1000) : 0);
+      const timeB = b.timestamp || (b.timeParsed ? Math.floor(b.timeParsed.getTime() / 1000) : 0);
+      return timeB - timeA;
+    });
+
+    // Final safety net: Strip anything that somehow bypassed the time check
+    const ultraFreshTweets = uniqueTweets.filter(t => {
+      const tTime = t.timestamp || (t.timeParsed ? Math.floor(t.timeParsed.getTime() / 1000) : 0);
+      return tTime >= tenMinutesAgo;
+    });
     
     // Save the finalized data to the global variable
-    instantFirehoseData = await enrichTweets(lastHourTweets);
-    console.log(`✅ Background Worker: Saved ${instantFirehoseData.length} new tweets to memory.`);
+    if (ultraFreshTweets.length > 0) {
+        instantFirehoseData = await enrichTweets(ultraFreshTweets);
+        console.log(`✅ Background Worker: Saved ${instantFirehoseData.length} tweets from the last 10 minutes.`);
+    } else {
+        console.log(`⚠️ Background Worker: No tweets found in the last 10 minutes. Keeping previous cache.`);
+    }
   } catch (err) {
     console.error('❌ Background Worker Error:', err.message);
   }
 }
-
 /**
  * The Curated Alpha Firehose (MEDIA ONLY)
  * NOW INSTANT: Returns the pre-fetched data from the background worker in 1 millisecond.
