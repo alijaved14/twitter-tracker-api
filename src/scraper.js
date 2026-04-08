@@ -94,11 +94,16 @@ export async function getProfile(username) {
   if (cached) return cached;
 
   const p = await scraper.getProfile(username);
+  
+  // FIX: Properly map the avatar field depending on the scraper version
+  const avatarUrl = p.avatar || p.profileImageUrl || p.profile_image_url_https || null;
+  const followers = p.followersCount ?? p.followers_count ?? 0;
+
   const formatted = {
     username:       p.username   || username,
     name:           p.name       || username,
-    avatar:         p.avatar     || null,
-    followersCount: p.followersCount ?? 0,
+    avatar:         avatarUrl,
+    followersCount: followers,
     isVerified:     p.isBlueVerified || p.isVerified || false,
   };
 
@@ -109,18 +114,11 @@ export async function getProfile(username) {
 // ─── Tweet helpers ────────────────────────────────────────────────────────────
 
 function formatTweet(tweet) {
-  // The scraper library uses a few different field names depending on version
-  // (likes/likeCount/favoriteCount, views/viewCount, etc). Try them all.
-  const likes =
-    tweet.likes ?? tweet.likeCount ?? tweet.favoriteCount ?? tweet.favorite_count ?? 0;
-  const retweets =
-    tweet.retweets ?? tweet.retweetCount ?? tweet.retweet_count ?? 0;
-  const replies =
-    tweet.replies ?? tweet.replyCount ?? tweet.reply_count ?? 0;
-  const views =
-    tweet.views ?? tweet.viewCount ?? tweet.view_count ?? 0;
+  const likes = tweet.likes ?? tweet.likeCount ?? tweet.favoriteCount ?? tweet.favorite_count ?? 0;
+  const retweets = tweet.retweets ?? tweet.retweetCount ?? tweet.retweet_count ?? 0;
+  const replies = tweet.replies ?? tweet.replyCount ?? tweet.reply_count ?? 0;
+  const views = tweet.views ?? tweet.viewCount ?? tweet.view_count ?? 0;
 
-  // Some scraper versions embed user/author data directly on the tweet object
   const embeddedUser = tweet.user || tweet.author || tweet.core?.user_results?.result?.legacy || {};
   const embeddedAvatar =
     embeddedUser.profile_image_url_https ||
@@ -162,7 +160,6 @@ function formatTweet(tweet) {
     permanentUrl: tweet.permanentUrl  || (tweet.id ? `https://x.com/${tweet.username}/status/${tweet.id}` : null),
     isRetweet:    tweet.isRetweet     || false,
     isReply:      tweet.isReply       || false,
-    // Pre-populate from embedded user if present — enrichment will overwrite later
     profileImage:   embeddedAvatar,
     displayName:    embeddedName,
     followersCount: embeddedFollowers,
@@ -185,19 +182,15 @@ async function enrichTweets(tweets) {
     const p = profileMap[tweet.username?.toLowerCase()] || {};
     return {
       ...tweet,
-      profileImage:   p.avatar         || null,
-      displayName:    p.name           || tweet.username,
-      followersCount: p.followersCount ?? 0,
-      isVerified:     p.isVerified     || false,
+      // FIX: Ensure we fall back to tweet.profileImage so we don't accidentally overwrite with null
+      profileImage:   p.avatar         || tweet.profileImage || null,
+      displayName:    p.name           || tweet.displayName || tweet.username,
+      followersCount: p.followersCount ?? tweet.followersCount ?? 0,
+      isVerified:     p.isVerified     || tweet.isVerified || false,
     };
   });
 }
 
-/**
- * Batched enrichment — fetches profiles 5 at a time instead of all at once,
- * with a per-profile timeout. Used by the background firehose to avoid
- * rate-limit hangs on large batches.
- */
 async function enrichTweetsBatched(tweets, batchSize = 5) {
   const usernames = [...new Set(tweets.map(t => t.username).filter(Boolean))];
   const profileMap = {};
@@ -222,10 +215,11 @@ async function enrichTweetsBatched(tweets, batchSize = 5) {
     const p = profileMap[tweet.username?.toLowerCase()] || {};
     return {
       ...tweet,
+      // FIX: Ensure we fall back to tweet.profileImage
       profileImage:   p.avatar         || tweet.profileImage || null,
-      displayName:    p.name           || tweet.username,
-      followersCount: p.followersCount ?? 0,
-      isVerified:     p.isVerified     || false,
+      displayName:    p.name           || tweet.displayName || tweet.username,
+      followersCount: p.followersCount ?? tweet.followersCount ?? 0,
+      isVerified:     p.isVerified     || tweet.isVerified || false,
     };
   });
 }
@@ -327,50 +321,28 @@ export async function getTrendingTweets(trendCount = 20, tweetsPerTrend = 3, mod
 
 // ─── LIVE FIREHOSE BACKGROUND WORKER ──────────────────────────────────────────
 
-const FIREHOSE_SOURCES = [
-  "tier10k", "FirstSquawk", "unusual_whales", "WatcherGuru", "lookonchain",
-  "Reuters", "BBCWorld", "aljazeeraenglish", "business", "Bloomberg", 
-  "TimesNow", "TheBlock__", "CoinDesk", "WuBlockchain",
-  "BitcoinNews", "cz_binance", "VitalikButerin", "Saylor", 
-  "brian_armstrong", "nayibbukele",
-  "EricBalchunas", "APompliano", "RaoulGMI", "novogratz", "Pentosh1",
-  "ArkhamIntel", "nansen_ai", "glassnode", "CryptoQuant_com",
-  "zerohedge", "db_news",
-  "elonmusk", "sama", "pmarca", "naval", "levelsio", "paulg",
-  "DrewPavlou", "dom_lucre", "wholemars", "BoredElonMusk",
-  "fityeth", "Tezzo100x", "thuggies_sol"
-];
-
-// Prevents overlapping background worker runs (if previous run hangs, skip new one)
 let backgroundRunning = false;
 
 // This runs silently in the background so the user never has to wait.
 async function runBackgroundFirehose() {
   if (!ready) return;
   if (backgroundRunning) {
-    console.log('⏭  Background Worker: previous run still in progress, skipping.');
     return;
   }
   backgroundRunning = true;
 
-  console.log('🔄 Background Worker: Fetching live feed...');
   try {
-    // Broad, high-volume queries. NO filter:verified (too restrictive),
-    // NO filter:media, NO strict time cutoff. Just recent tweets from
-    // high-activity topics.
-    // Removed lang:en — some scraper builds don't support it and silently return 0.
+    // FIX: Re-added `min_faves:15` and `filter:verified` to guarantee engagement
+    // and high-quality profiles (preventing the 0-like bot spam).
     const queries = [
-      '(crypto OR bitcoin OR $SOL OR memecoin OR ethereum OR solana) -filter:replies',
-      '(AI OR OpenAI OR ChatGPT OR elon OR SpaceX) -filter:replies',
-      '(breaking OR "just in" OR news) -filter:replies',
+      '(crypto OR $SOL OR memecoin OR pump.fun OR dexscreener) filter:verified min_faves:15 -filter:replies',
+      '(AI OR OpenAI OR ChatGPT OR SpaceX OR robotics) filter:verified min_faves:15 -filter:replies',
+      '(breaking OR alert OR "just in" OR ceasefire OR war) filter:verified filter:media min_faves:15 -filter:replies'
     ];
 
     const allTweets = [];
-    // 1-hour soft cutoff (relaxed from 10 min). Tweets older than this are dropped,
-    // but the loop does NOT break early on them — it keeps looking for newer ones.
     const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
 
-    // Back to Latest — Top mode hangs in this scraper version
     const results = await Promise.allSettled(
       queries.map(async (query) => {
         const out = [];
@@ -381,9 +353,6 @@ async function runBackgroundFirehose() {
             if (iterated > 25) break;
             out.push(formatTweet(tweet));
           }
-          const withLikes = out.filter(t => t.likes > 0).length;
-          const withViews = out.filter(t => t.views > 0).length;
-          console.log(`  ↳ [${query.slice(0, 40)}...] fetched ${out.length} (${withLikes}L ${withViews}V)`);
         } catch (err) {
           console.error(`[Firehose] Error on query [${query.slice(0, 40)}]:`, err.message);
         }
@@ -400,7 +369,7 @@ async function runBackgroundFirehose() {
       new Map(allTweets.filter(t => t && t.id).map(t => [t.id, t])).values()
     );
 
-    // Prefer fresh (< 1 hour) but fall back to whatever we have if fresh is empty
+    // Keep tweets from the last hour
     const freshTweets = uniqueTweets.filter(t => {
       const tTime = t.timestamp || (t.timeParsed ? Math.floor(new Date(t.timeParsed).getTime() / 1000) : 0);
       return tTime >= oneHourAgo;
@@ -416,13 +385,11 @@ async function runBackgroundFirehose() {
     });
 
     if (finalTweets.length > 0) {
-      const capped = finalTweets.slice(0, 60); // 60 is enough, keeps enrichment fast
+      const capped = finalTweets.slice(0, 60);
 
-      // Save raw immediately so /api/live never returns empty even if enrichment hangs
+      // Save raw immediately 
       instantFirehoseData = capped;
-      console.log(`✅ Background Worker: Saved ${capped.length} raw tweets. Enriching...`);
 
-      // Now wait (with timeout) for enrichment so the cache has profile data
       try {
         const enriched = await Promise.race([
           enrichTweetsBatched(capped),
@@ -430,46 +397,33 @@ async function runBackgroundFirehose() {
         ]);
         if (Array.isArray(enriched) && enriched.length > 0) {
           instantFirehoseData = enriched;
-          const withAvatars = enriched.filter(t => t.profileImage).length;
-          console.log(`🎨 Enriched ${enriched.length} tweets (${withAvatars} with avatars).`);
         }
       } catch (e) {
         console.warn(`⚠️ Enrichment failed/timed out: ${e.message} — keeping raw tweets.`);
       }
-    } else {
-      console.warn('⚠️ Background Worker: ALL queries returned 0 tweets. Twitter auth may be broken.');
     }
   } catch (err) {
-    console.error('❌ Background Worker Error:', err.message, err.stack);
+    console.error('❌ Background Worker Error:', err.message);
   } finally {
     backgroundRunning = false;
   }
 }
-/**
- * Live firehose — returns recent tweets across all topics.
- * If background worker has populated the cache, returns instantly.
- * Otherwise a SINGLE-FLIGHT fallback search runs so 20 concurrent
- * requests don't trigger 20 concurrent Twitter searches (which hang).
- */
+
 let fallbackInFlight = null;
 
 export async function getLiveFirehose(count = 30) {
-  // Fast path: background worker (or previous fallback) has populated cache
   if (instantFirehoseData.length > 0) {
     return instantFirehoseData.slice(0, count);
   }
 
-  // Single-flight: if a fallback is already running, await it instead of starting a new one
   if (fallbackInFlight) {
     await fallbackInFlight;
     return instantFirehoseData.slice(0, count);
   }
 
-  console.log('⚡ getLiveFirehose: cache empty, running ONE fallback search (single-flight)...');
-
   fallbackInFlight = (async () => {
     try {
-      const q = '(crypto OR bitcoin OR solana OR news OR AI) -filter:replies';
+      const q = '(crypto OR solana OR news OR AI) filter:verified min_faves:10 -filter:replies';
       const collected = [];
 
       try {
@@ -479,7 +433,7 @@ export async function getLiveFirehose(count = 30) {
           if (++n >= 40) break;
         }
       } catch (err) {
-        console.error(`[fallback search] failed:`, err.message);
+        // ignore
       }
 
       const unique = Array.from(
@@ -489,8 +443,6 @@ export async function getLiveFirehose(count = 30) {
 
       if (unique.length > 0) {
         instantFirehoseData = unique;
-        console.log(`⚡ Fallback saved ${unique.length} raw tweets. Enriching...`);
-
         try {
           const enriched = await Promise.race([
             enrichTweetsBatched(unique),
@@ -498,13 +450,8 @@ export async function getLiveFirehose(count = 30) {
           ]);
           if (Array.isArray(enriched) && enriched.length > 0) {
             instantFirehoseData = enriched;
-            console.log(`🎨 Fallback enriched ${enriched.length} tweets.`);
           }
-        } catch (e) {
-          console.warn(`[fallback enrichment] skipped: ${e.message}`);
-        }
-      } else {
-        console.warn('⚡ Fallback returned 0 tweets.');
+        } catch (e) {}
       }
     } finally {
       fallbackInFlight = null;
@@ -515,9 +462,6 @@ export async function getLiveFirehose(count = 30) {
   return instantFirehoseData.slice(0, count);
 }
 
-/**
- * Debug: returns the current state of the firehose cache.
- */
 export function getFirehoseStatus() {
   return {
     cacheSize: instantFirehoseData.length,
