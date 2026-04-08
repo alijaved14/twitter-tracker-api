@@ -260,8 +260,65 @@ export async function getMultiAccountFeed(accounts, perAccount = 5) {
   return all;
 }
 
+/**
+ * Get currently trending topics on Twitter.
+ * Returns an array of trend strings (e.g. ["#Bitcoin", "Elon Musk", ...])
+ */
+const trendsCache = new TTLCache();
+const TRENDS_CACHE_TTL = 5 * 60_000; // 5 min — trends don't change that fast
+
+export async function getTrends() {
+  const cached = trendsCache.get('trends');
+  if (cached) return cached;
+
+  const trends = await scraper.getTrends();
+  trendsCache.set('trends', trends, TRENDS_CACHE_TTL);
+  return trends;
+}
+
+/**
+ * Get trending tweets: fetch current trends, then search tweets for top N trends.
+ * @param {number} trendCount    How many trending topics to pull tweets for (default 5)
+ * @param {number} tweetsPerTrend Tweets per trend (default 4)
+ * @param {'latest'|'top'} mode
+ */
+export async function getTrendingTweets(trendCount = 5, tweetsPerTrend = 4, mode = 'top') {
+  const cacheKey = `trending:${trendCount}:${tweetsPerTrend}:${mode}`;
+  const cached   = tweetCache.get(cacheKey);
+  if (cached) return cached;
+
+  const trends = await getTrends();
+  const topTrends = trends.slice(0, trendCount);
+
+  const searchMode = mode === 'top' ? SearchMode.Top : SearchMode.Latest;
+
+  const results = await Promise.allSettled(
+    topTrends.map(async (trend) => {
+      const tweets = [];
+      for await (const tweet of scraper.searchTweets(trend, tweetsPerTrend, searchMode)) {
+        tweets.push({ ...formatTweet(tweet), trend });
+        if (tweets.length >= tweetsPerTrend) break;
+      }
+      return tweets;
+    })
+  );
+
+  const all = results
+    .filter(r => r.status === 'fulfilled')
+    .flatMap(r => r.value)
+    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+  const enriched = await enrichTweets(all);
+  // Re-attach trend label after enrichment (enrichTweets spreads the tweet)
+  const withTrend = enriched.map((t, i) => ({ ...t, trend: all[i]?.trend || '' }));
+
+  tweetCache.set(cacheKey, withTrend, TRENDS_CACHE_TTL);
+  return withTrend;
+}
+
 // ─── Cache maintenance ────────────────────────────────────────────────────────
 setInterval(() => {
   profileCache.cleanup();
   tweetCache.cleanup();
+  trendsCache.cleanup();
 }, 5 * 60_000);

@@ -26,6 +26,8 @@ import {
   getUserTweets,
   getProfile,
   getMultiAccountFeed,
+  getTrends,
+  getTrendingTweets,
 } from './scraper.js';
 
 // ─── App setup ────────────────────────────────────────────────────────────────
@@ -212,6 +214,48 @@ app.get('/api/tracker', requireAuth, scraperGuard, async (req, res) => {
     res.json({ success: true, count: tweets.length, query: q, tweets });
   } catch (err) {
     console.error('[/api/tracker]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/trends
+ * Returns the current list of trending topics on Twitter (strings).
+ *
+ * Example: /api/trends
+ */
+app.get('/api/trends', requireAuth, scraperGuard, async (_req, res) => {
+  try {
+    const trends = await getTrends();
+    res.json({ success: true, count: trends.length, trends });
+  } catch (err) {
+    console.error('[/api/trends]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/trending
+ * Returns tweets from the current top trending topics — the real "what's trending" feed.
+ *
+ * Query params:
+ *   topics  {number}  How many trending topics to fetch tweets for (1–10, default 5)
+ *   per     {number}  Tweets per topic (1–10, default 4)
+ *   mode    {string}  'latest'|'top' (default: 'top')
+ *
+ * Example: /api/trending?topics=5&per=4
+ */
+app.get('/api/trending', requireAuth, scraperGuard, async (req, res) => {
+  const { topics = 5, per = 4, mode = 'top' } = req.query;
+
+  const trendCount    = Math.min(Math.max(parseInt(topics, 10) || 5, 1), 10);
+  const tweetsPerTrend = Math.min(Math.max(parseInt(per, 10)   || 4, 1), 10);
+
+  try {
+    const tweets = await getTrendingTweets(trendCount, tweetsPerTrend, mode);
+    res.json({ success: true, count: tweets.length, tweets });
+  } catch (err) {
+    console.error('[/api/trending]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
