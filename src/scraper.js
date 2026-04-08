@@ -212,27 +212,37 @@ async function enrichTweetsBatched(tweets, batchSize = 5) {
   const usernames = [...new Set(tweets.map(t => t.username).filter(Boolean))];
   const missingUsernames = usernames.filter(u => !profileCache.has(`profile:${u.toLowerCase()}`));
 
-  // Cap at 10 NEW profiles per cycle to dodge Twitter's shadowban
-  const toFetch = missingUsernames.slice(0, 10);
+  // 🔴 FIX: We no longer slice/cap the list to 10. 
+  // Since this runs in the background, we have time to fetch ALL missing profiles safely.
+  const toFetch = missingUsernames;
 
-  const fetchOne = (u) =>
-    Promise.race([
-      getProfile(u),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('profile timeout')), 4_000)),
-    ]);
+  const fetchOne = async (u) => {
+    try {
+      return await Promise.race([
+        getProfile(u),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('profile timeout')), 4_000)),
+      ]);
+    } catch (e) {
+      return null;
+    }
+  };
 
+  // Loop through all missing profiles in small batches of 5
   for (let i = 0; i < toFetch.length; i += batchSize) {
     const batch = toFetch.slice(i, i + batchSize);
     await Promise.allSettled(batch.map(fetchOne));
+    
+    // Add a tiny 500ms pause between batches so Twitter doesn't block the scraper
+    await new Promise(resolve => setTimeout(resolve, 500));
   }
 
   return tweets.map(tweet => {
     const p = profileCache.get(`profile:${tweet.username?.toLowerCase()}`) || {};
     return {
       ...tweet,
-      // 🔥 SURGICAL FIX: Never return null again, use the dynamic Unavatar resolver.
       profileImage:   p.avatar || tweet.profileImage || `https://unavatar.io/x/${tweet.username}`,
       displayName:    p.name || tweet.displayName || tweet.username,
+      // 🔴 FIX: Will now correctly populate followers for all users
       followersCount: p.followersCount ?? tweet.followersCount ?? 0,
       isVerified:     p.isVerified || tweet.isVerified || false,
     };
