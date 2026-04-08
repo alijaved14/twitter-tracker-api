@@ -269,63 +269,72 @@ const FIREHOSE_SOURCES = [
 async function runBackgroundFirehose() {
   if (!ready) return;
 
-  console.log('🔄 Background Worker: Fetching 10-seconds-ago alpha...');
+  console.log('🔄 Background Worker: Fetching live feed...');
   try {
-    // ─── THE CREATEMEME ALPHA QUERY ───
-    // We stop using massive 'from:' lists which crash the search engine.
-    // Instead, we search for the exact topics that drive the market, 
-    // restrict it to verified accounts to kill spam, and use SearchMode.Latest.
+    // Broad, high-volume queries. NO filter:verified (too restrictive),
+    // NO filter:media, NO strict time cutoff. Just recent tweets from
+    // high-activity topics.
     const queries = [
-      '(crypto OR $SOL OR memecoin OR pump.fun OR dexscreener) filter:verified -filter:replies',
-      '(AI OR OpenAI OR ChatGPT OR SpaceX OR robotics) filter:verified -filter:replies',
-      '(breaking OR alert OR "just in" OR ceasefire OR war) filter:verified filter:media -filter:replies'
+      '(crypto OR bitcoin OR $SOL OR memecoin OR "pump.fun" OR dexscreener OR ethereum) -filter:replies lang:en',
+      '(AI OR OpenAI OR ChatGPT OR SpaceX OR elon OR tech) -filter:replies lang:en',
+      '(breaking OR "just in" OR news OR alert) -filter:replies lang:en',
     ];
 
     const allTweets = [];
-    const tenMinutesAgo = Math.floor(Date.now() / 1000) - 600; // STRICT 10-minute cutoff
+    // 1-hour soft cutoff (relaxed from 10 min). Tweets older than this are dropped,
+    // but the loop does NOT break early on them — it keeps looking for newer ones.
+    const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
 
-    for (const query of queries) {
-      try {
-        for await (const tweet of scraper.searchTweets(query, 15, SearchMode.Latest)) {
-          const tweetTime = tweet.timestamp || (tweet.timeParsed ? Math.floor(tweet.timeParsed.getTime() / 1000) : 0);
-          
-          // HARD STOP: If a tweet is older than 10 minutes, kill the loop immediately.
-          if (tweetTime > 0 && tweetTime < tenMinutesAgo) {
-            break; 
+    const results = await Promise.allSettled(
+      queries.map(async (query) => {
+        const out = [];
+        try {
+          let iterated = 0;
+          for await (const tweet of scraper.searchTweets(query, 25, SearchMode.Latest)) {
+            iterated++;
+            if (iterated > 25) break; // safety
+            out.push(formatTweet(tweet));
           }
-          
-          allTweets.push(formatTweet(tweet));
+          console.log(`  ↳ [${query.slice(0, 40)}...] fetched ${out.length} tweets`);
+        } catch (err) {
+          console.error(`[Firehose] Error on query [${query.slice(0, 40)}]:`, err.message);
         }
-      } catch (err) {
-        console.error(`[Firehose] Error on query [${query}]:`, err.message);
-      }
-    }
+        return out;
+      })
+    );
 
-    // Deduplicate
-    const uniqueTweets = Array.from(new Map(allTweets.map(t => [t.id, t])).values());
-    
-    // Sort strictly by absolute newest first
-    uniqueTweets.sort((a, b) => {
-      const timeA = a.timestamp || (a.timeParsed ? Math.floor(a.timeParsed.getTime() / 1000) : 0);
-      const timeB = b.timestamp || (b.timeParsed ? Math.floor(b.timeParsed.getTime() / 1000) : 0);
+    results
+      .filter(r => r.status === 'fulfilled')
+      .forEach(r => allTweets.push(...r.value));
+
+    // Deduplicate by id
+    const uniqueTweets = Array.from(
+      new Map(allTweets.filter(t => t && t.id).map(t => [t.id, t])).values()
+    );
+
+    // Prefer fresh (< 1 hour) but fall back to whatever we have if fresh is empty
+    const freshTweets = uniqueTweets.filter(t => {
+      const tTime = t.timestamp || (t.timeParsed ? Math.floor(new Date(t.timeParsed).getTime() / 1000) : 0);
+      return tTime >= oneHourAgo;
+    });
+
+    const finalTweets = freshTweets.length > 0 ? freshTweets : uniqueTweets;
+
+    // Sort newest first
+    finalTweets.sort((a, b) => {
+      const timeA = a.timestamp || (a.timeParsed ? Math.floor(new Date(a.timeParsed).getTime() / 1000) : 0);
+      const timeB = b.timestamp || (b.timeParsed ? Math.floor(new Date(b.timeParsed).getTime() / 1000) : 0);
       return timeB - timeA;
     });
 
-    // Final safety net: Strip anything that somehow bypassed the time check
-    const ultraFreshTweets = uniqueTweets.filter(t => {
-      const tTime = t.timestamp || (t.timeParsed ? Math.floor(t.timeParsed.getTime() / 1000) : 0);
-      return tTime >= tenMinutesAgo;
-    });
-    
-    // Save the finalized data to the global variable
-    if (ultraFreshTweets.length > 0) {
-        instantFirehoseData = await enrichTweets(ultraFreshTweets);
-        console.log(`✅ Background Worker: Saved ${instantFirehoseData.length} tweets from the last 10 minutes.`);
+    if (finalTweets.length > 0) {
+      instantFirehoseData = await enrichTweets(finalTweets.slice(0, 100));
+      console.log(`✅ Background Worker: Saved ${instantFirehoseData.length} tweets (${freshTweets.length} fresh < 1h).`);
     } else {
-        console.log(`⚠️ Background Worker: No tweets found in the last 10 minutes. Keeping previous cache.`);
+      console.warn('⚠️ Background Worker: ALL queries returned 0 tweets. Twitter auth may be broken.');
     }
   } catch (err) {
-    console.error('❌ Background Worker Error:', err.message);
+    console.error('❌ Background Worker Error:', err.message, err.stack);
   }
 }
 /**
