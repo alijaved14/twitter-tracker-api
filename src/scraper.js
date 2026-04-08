@@ -324,25 +324,37 @@ export async function getTrendingTweets(trendCount = 20, tweetsPerTrend = 3, mod
 
 
 /**
- * The "Ultra-Fast Alpha" Firehose
- * One single, highly optimized query to fetch VIPs, narratives, and crypto launches instantly.
+ * The "Real Twitter Trends" Live Firehose
+ * Dynamically fetches the current global Twitter trends, then streams the 
+ * absolute newest tweets (seconds ago) about those specific topics.
  * @param {number} count Max tweets to return
  */
 export async function getLiveFirehose(count = 30) {
-  const cacheKey = `live:firehose:fast:${count}`;
+  const cacheKey = `live:firehose:real_trends:${count}`;
   const cached   = tweetCache.get(cacheKey);
   if (cached) return cached;
 
-  // ─── THE MASTER QUERY ───
-  // We combine VIPs, crypto platforms, and narrative keywords into ONE search.
-  // We set min_faves:5. This is the magic number: it filters out 0-like bot spam,
-  // but is low enough to catch viral tweets seconds/minutes after they are posted.
-  const query = '(from:elonmusk OR from:realDonaldTrump OR from:VitalikButerin OR "pump.fun" OR "dexscreener" OR memecoin OR "new meta") min_faves:5 -filter:replies';
+  // 1. Fetch the actual current global Twitter trends (e.g., "Moo Deng", "Donald Trump")
+  const allTrends = await getTrends();
+  
+  // 2. Take the top 10 to avoid Twitter's max query length limits
+  // We wrap them in quotes so we search for the exact trending phrases
+  const topTrends = allTrends.slice(0, 10).map(trend => `"${trend}"`);
+  
+  if (topTrends.length === 0) {
+      return []; // Safety fallback
+  }
+
+  // 3. Build the dynamic query! 
+  // It searches for ANY of the current trends.
+  // We use filter:verified to prevent basic bot spam, but NO likes requirement 
+  // so we get tweets from literally seconds ago.
+  const query = `(${topTrends.join(' OR ')}) filter:verified -filter:replies`;
   
   const tweets = [];
 
   try {
-    // SearchMode.Latest + a single query = blazing fast execution
+    // SearchMode.Latest guarantees we get the freshest tweets about the current trends
     for await (const tweet of scraper.searchTweets(query, count, SearchMode.Latest)) {
       tweets.push(formatTweet(tweet));
       if (tweets.length >= count) break;
@@ -351,9 +363,11 @@ export async function getLiveFirehose(count = 30) {
     console.error('[/api/live] Search error:', err.message);
   }
 
+  // 4. Enrich with profile pictures and followers
   const enriched = await enrichTweets(tweets);
   
-  // Cache for just 10 seconds to keep the feed feeling ultra real-time
+  // Cache for 10 seconds. Since it's 'Latest', polling this every 10-15s will 
+  // give you a constant, fast-moving river of the current global trends.
   tweetCache.set(cacheKey, enriched, 10_000); 
   return enriched;
 }
