@@ -323,52 +323,90 @@ export async function getTrendingTweets(trendCount = 20, tweetsPerTrend = 3, mod
 }
 
 
+// The Pro-Tier Alpha List
+const FIREHOSE_SOURCES = [
+  // 🚨 BREAKING / FASTEST (ALPHA CORE)
+  "tier10k", "FirstSquawk", "unusual_whales", "WatcherGuru", "lookonchain",
+  // 📰 GLOBAL NEWS (HIGH TRUST)
+  "Reuters", "BBCWorld", "aljazeeraenglish", "business", "Bloomberg", 
+  "TimesNow", "TheBlock__", "CoinDesk", "WuBlockchain",
+  // 🪙 CRYPTO CORE (MARKET MOVING)
+  "BitcoinNews", "cz_binance", "VitalikButerin", "Saylor", 
+  "brian_armstrong", "nayibbukele",
+  // 🧠 SMART MONEY / ANALYSTS
+  "EricBalchunas", "APompliano", "RaoulGMI", "novogratz", "Pentosh1",
+  // 🔍 ON-CHAIN / INSIDER SIGNAL
+  "ArkhamIntel", "nansen_ai", "glassnode", "CryptoQuant_com",
+  // ⚡ CURATORS / AGGREGATORS
+  "zerohedge", "db_news",
+  // 🤖 TECH / AI / STARTUP
+  "elonmusk", "sama", "pmarca", "naval", "levelsio", "paulg",
+  // 🌍 VIRAL / OPINION / DISTRIBUTION
+  "DrewPavlou", "dom_lucre", "wholemars", "BoredElonMusk",
+  // 🎯 OPTIONAL MEME / DEGEN FLOW
+  "fityeth", "Tezzo100x", "thuggies_sol"
+];
+
 /**
- * The "Real Twitter Trends" Live Firehose
- * Dynamically fetches the current global Twitter trends, then streams the 
- * absolute newest tweets (seconds ago) about those specific topics.
+ * The Curated Alpha Firehose
+ * Loops through curated accounts in batches, fetching ONLY tweets from the last hour.
  * @param {number} count Max tweets to return
  */
 export async function getLiveFirehose(count = 30) {
-  const cacheKey = `live:firehose:real_trends:${count}`;
+  const cacheKey = `live:firehose:curated:${count}`;
   const cached   = tweetCache.get(cacheKey);
   if (cached) return cached;
 
-  // 1. Fetch the actual current global Twitter trends (e.g., "Moo Deng", "Donald Trump")
-  const allTrends = await getTrends();
-  
-  // 2. Take the top 10 to avoid Twitter's max query length limits
-  // We wrap them in quotes so we search for the exact trending phrases
-  const topTrends = allTrends.slice(0, 10).map(trend => `"${trend}"`);
-  
-  if (topTrends.length === 0) {
-      return []; // Safety fallback
+  // 1. Remove any accidental duplicates from the raw list
+  const uniqueSources = [...new Set(FIREHOSE_SOURCES)];
+
+  // 2. Chunk into batches of 10 to avoid Twitter query length limits
+  const chunkSize = 10;
+  const batches = [];
+  for (let i = 0; i < uniqueSources.length; i += chunkSize) {
+    batches.push(uniqueSources.slice(i, i + chunkSize));
   }
 
-  // 3. Build the dynamic query! 
-  // It searches for ANY of the current trends.
-  // We use filter:verified to prevent basic bot spam, but NO likes requirement 
-  // so we get tweets from literally seconds ago.
-  const query = `(${topTrends.join(' OR ')}) filter:verified -filter:replies`;
-  
-  const tweets = [];
+  // 3. Define the 1-hour cutoff (in seconds)
+  const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
+  const allTweets = [];
 
-  try {
-    // SearchMode.Latest guarantees we get the freshest tweets about the current trends
-    for await (const tweet of scraper.searchTweets(query, count, SearchMode.Latest)) {
-      tweets.push(formatTweet(tweet));
-      if (tweets.length >= count) break;
+  // 4. Sequential Loop to prevent API Rate Limits (429s)
+  for (const batch of batches) {
+    // Build query: (from:user1 OR from:user2) -filter:replies
+    const fromQuery = batch.map(user => `from:${user}`).join(' OR ');
+    const query = `(${fromQuery}) -filter:replies`;
+
+    try {
+      // SearchMode.Latest returns newest first
+      for await (const tweet of scraper.searchTweets(query, 20, SearchMode.Latest)) {
+        // FAST-EXIT: If we hit a tweet older than 1 hour, immediately stop 
+        // fetching for this batch because everything after it will be even older.
+        if (tweet.timestamp && tweet.timestamp < oneHourAgo) {
+          break; 
+        }
+        allTweets.push(formatTweet(tweet));
+      }
+    } catch (err) {
+      console.error(`[Firehose] Batch error for query [${query}]:`, err.message);
     }
-  } catch (err) {
-    console.error('[/api/live] Search error:', err.message);
   }
 
-  // 4. Enrich with profile pictures and followers
-  const enriched = await enrichTweets(tweets);
+  // 5. Deduplicate across batches
+  const uniqueTweets = Array.from(new Map(allTweets.map(t => [t.id, t])).values());
+
+  // 6. Sort by timestamp (Absolute newest at the top)
+  uniqueTweets.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+  // 7. Enforce strictly within the last hour (fallback in case Twitter sorting glitched)
+  const lastHourTweets = uniqueTweets.filter(t => t.timestamp && t.timestamp >= oneHourAgo);
+
+  // 8. Trim to the requested count and enrich
+  const finalTweets = lastHourTweets.slice(0, count);
+  const enriched = await enrichTweets(finalTweets);
   
-  // Cache for 10 seconds. Since it's 'Latest', polling this every 10-15s will 
-  // give you a constant, fast-moving river of the current global trends.
-  tweetCache.set(cacheKey, enriched, 10_000); 
+  // Cache for 15 seconds
+  tweetCache.set(cacheKey, enriched, 15_000); 
   return enriched;
 }
 // ─── Cache maintenance ────────────────────────────────────────────────────────
