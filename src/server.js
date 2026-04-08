@@ -35,6 +35,10 @@ const app    = express();
 const PORT   = process.env.PORT || 3000;
 const SECRET = process.env.API_SECRET || '';
 
+// Render (and most cloud hosts) sit behind a reverse proxy that sets
+// X-Forwarded-For. Without this, express-rate-limit throws a validation error.
+app.set('trust proxy', 1);
+
 app.use(express.json());
 app.use(cors({
   origin: '*',             // tighten to your domain in production
@@ -236,24 +240,35 @@ app.get('/api/trends', requireAuth, scraperGuard, async (_req, res) => {
 
 /**
  * GET /api/trending
- * Returns tweets from the current top trending topics — the real "what's trending" feed.
+ * Returns tweets from ALL current trending topics on Twitter globally.
  *
  * Query params:
- *   topics  {number}  How many trending topics to fetch tweets for (1–10, default 5)
- *   per     {number}  Tweets per topic (1–10, default 4)
+ *   topics  {number}  How many trending topics to use (1–20, default all)
+ *   per     {number}  Tweets per topic (1–10, default 3)
  *   mode    {string}  'latest'|'top' (default: 'top')
  *
- * Example: /api/trending?topics=5&per=4
+ * Example: /api/trending
+ * Example: /api/trending?topics=10&per=5
  */
 app.get('/api/trending', requireAuth, scraperGuard, async (req, res) => {
-  const { topics = 5, per = 4, mode = 'top' } = req.query;
+  const { topics, per = 3, mode = 'top' } = req.query;
 
-  const trendCount    = Math.min(Math.max(parseInt(topics, 10) || 5, 1), 10);
-  const tweetsPerTrend = Math.min(Math.max(parseInt(per, 10)   || 4, 1), 10);
+  const tweetsPerTrend = Math.min(Math.max(parseInt(per, 10) || 3, 1), 10);
 
   try {
+    // Fetch all current trends first
+    const allTrends  = await getTrends();
+    const trendCount = topics
+      ? Math.min(Math.max(parseInt(topics, 10) || allTrends.length, 1), 20)
+      : allTrends.length;
+
     const tweets = await getTrendingTweets(trendCount, tweetsPerTrend, mode);
-    res.json({ success: true, count: tweets.length, tweets });
+    res.json({
+      success: true,
+      trendingTopics: allTrends.slice(0, trendCount),
+      count: tweets.length,
+      tweets,
+    });
   } catch (err) {
     console.error('[/api/trending]', err.message);
     res.status(500).json({ error: err.message });
