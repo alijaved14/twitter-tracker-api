@@ -1,13 +1,19 @@
 /**
  * Twitter scraper singleton.
  *
- * Auth priority:
- *   1. TWITTER_COOKIES env var  (base64-encoded JSON array of cookie strings)
- *   2. TWITTER_USERNAME + TWITTER_PASSWORD  (fresh login)
+ * Auth — set TWITTER_COOKIES env var in Render (recommended):
  *
- * On first login the raw cookie string is printed to stdout so you can
- * copy it into the TWITTER_COOKIES env var in Render — this prevents
- * re-logging in on every cold start (which accelerates account bans).
+ *   Simple format (just auth_token + ct0 from browser):
+ *     auth_token=YOUR_AUTH_TOKEN; ct0=YOUR_CT0_TOKEN
+ *
+ *   How to get cookies:
+ *     1. Open https://x.com in Chrome, make sure you're logged in
+ *     2. Press F12 → Application → Cookies → https://x.com
+ *     3. Copy the Value of  auth_token  and  ct0
+ *     4. Paste into Render env var as:  auth_token=VALUE; ct0=VALUE
+ *
+ * Username/password login is intentionally disabled —
+ * Cloudflare blocks it on server IPs.
  */
 
 import { Scraper, SearchMode } from '@the-convocation/twitter-scraper';
@@ -44,79 +50,66 @@ async function cookiesToString(cookies) {
 // ─── Init / Auth ─────────────────────────────────────────────────────────────
 
 export async function initScraper() {
-  // Only run once even if called multiple times
   if (initPromise) return initPromise;
 
   initPromise = (async () => {
     scraper = new Scraper();
 
-    // ── 1. Try restoring session from TWITTER_COOKIES ────────────────────────
     const cookieEnv = process.env.TWITTER_COOKIES;
-    if (cookieEnv) {
-      try {
-        // Support both raw semicolon string AND base64-encoded JSON array
-        let cookieList;
-        try {
-          // Try base64-encoded JSON array first (safer for env vars with semicolons)
-          cookieList = JSON.parse(Buffer.from(cookieEnv, 'base64').toString('utf8'));
-          if (Array.isArray(cookieList)) {
-            await scraper.setCookies(cookieList.map(c => Cookie.parse(c)).filter(Boolean));
-          } else {
-            throw new Error('not an array');
-          }
-        } catch {
-          // Fall back to raw semicolon string
-          await scraper.setCookies(parseCookieString(cookieEnv));
-        }
 
-        ready = await scraper.isLoggedIn();
-
-        if (ready) {
-          console.log('✅ Session restored from TWITTER_COOKIES');
-          return;
-        }
-
-        console.warn('⚠️  Cookies present but session invalid — will re-login');
-      } catch (err) {
-        console.warn('⚠️  Failed to restore cookies:', err.message);
-      }
-    }
-
-    // ── 2. Fresh login with credentials ──────────────────────────────────────
-    const { TWITTER_USERNAME, TWITTER_PASSWORD, TWITTER_EMAIL } = process.env;
-
-    if (!TWITTER_USERNAME || !TWITTER_PASSWORD) {
-      console.error(
-        '❌ No valid session and no TWITTER_USERNAME/PASSWORD set.\n' +
-        '   Set at least TWITTER_USERNAME and TWITTER_PASSWORD in env vars.'
-      );
+    if (!cookieEnv || !cookieEnv.trim()) {
+      console.error('');
+      console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      console.error('❌  TWITTER_COOKIES env var is not set.');
+      console.error('');
+      console.error('   1. Open https://x.com in Chrome (logged in)');
+      console.error('   2. Press F12 → Application → Cookies → https://x.com');
+      console.error('   3. Copy auth_token value and ct0 value');
+      console.error('   4. In Render dashboard → Environment, set:');
+      console.error('      TWITTER_COOKIES = auth_token=YOURVALUE; ct0=YOURVALUE');
+      console.error('   5. Redeploy');
+      console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      console.error('');
       return;
     }
 
     try {
-      console.log(`🔐 Logging in as @${TWITTER_USERNAME}...`);
-      await scraper.login(TWITTER_USERNAME, TWITTER_PASSWORD, TWITTER_EMAIL);
+      // Parse the cookie string — supports:
+      //   auth_token=X; ct0=Y                  (simple browser copy-paste)
+      //   base64-encoded JSON array             (legacy format)
+      let cookiesToSet;
+
+      try {
+        const decoded = Buffer.from(cookieEnv.trim(), 'base64').toString('utf8');
+        const arr     = JSON.parse(decoded);
+        if (Array.isArray(arr)) {
+          cookiesToSet = arr.map(c => Cookie.parse(c)).filter(Boolean);
+          console.log('🍪 Loaded cookies from base64 JSON format');
+        } else {
+          throw new Error('not an array');
+        }
+      } catch {
+        // Plain  auth_token=X; ct0=Y  string — the normal case
+        cookiesToSet = parseCookieString(cookieEnv.trim());
+        console.log('🍪 Loaded cookies from plain string format');
+      }
+
+      if (!cookiesToSet.length) {
+        throw new Error('No valid cookies could be parsed from TWITTER_COOKIES');
+      }
+
+      await scraper.setCookies(cookiesToSet);
       ready = await scraper.isLoggedIn();
 
       if (ready) {
-        const cookies    = await scraper.getCookies();
-        const cookieArr  = cookies.map(c => c.toString());
-        const b64Cookies = Buffer.from(JSON.stringify(cookieArr)).toString('base64');
-
-        console.log('✅ Logged in successfully');
-        console.log('');
-        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-        console.log('💾  SAVE THIS to TWITTER_COOKIES env var in Render');
-        console.log('    (prevents re-login on every cold-start)');
-        console.log('');
-        console.log(b64Cookies);
-        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-        console.log('');
+        console.log('✅ Twitter session active — scraper is ready');
       } else {
-        console.error('❌ Login completed but isLoggedIn() returned false');
+        console.error('❌ Cookies loaded but session is invalid.');
+        console.error('   Your auth_token or ct0 may be expired.');
+        console.error('   Get fresh cookies from your browser and update TWITTER_COOKIES in Render.');
       }
     } catch (err) {
-      console.error('❌ Login failed:', err.message);
+      console.error('❌ Failed to load cookies:', err.message);
     }
   })();
 
