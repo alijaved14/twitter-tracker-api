@@ -71,7 +71,8 @@ export async function initScraper() {
         
         // 🔥 START THE BACKGROUND WORKER HERE 🔥
         runBackgroundFirehose();
-        setInterval(runBackgroundFirehose, 30_000); // Polls Twitter every 30 seconds
+        // FIX: Increased to 60 seconds to prevent 503 Rate Limit bans from Twitter
+        setInterval(runBackgroundFirehose, 60_000); 
         
       } else {
         console.error('❌ Cookies loaded but session is invalid.');
@@ -197,4 +198,307 @@ async function enrichTweets(tweets) {
   const fetchOne = (u) =>
     Promise.race([
       getProfile(u),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('profile timeout')), 4_00
+      new Promise((_, reject) => setTimeout(() => reject(new Error('profile timeout')), 4_000)),
+    ]);
+
+  await Promise.allSettled(toFetch.map(fetchOne));
+
+  return tweets.map(tweet => {
+    const p = profileCache.get(`profile:${tweet.username?.toLowerCase()}`) || {};
+    return {
+      ...tweet,
+      profileImage:   p.avatar         || tweet.profileImage || null,
+      displayName:    p.name           || tweet.displayName || tweet.username,
+      followersCount: p.followersCount ?? tweet.followersCount ?? 0,
+      isVerified:     p.isVerified     || tweet.isVerified || false,
+    };
+  });
+}
+
+async function enrichTweetsBatched(tweets, batchSize = 5) {
+  const usernames = [...new Set(tweets.map(t => t.username).filter(Boolean))];
+
+  // Only fetch users that aren't already cached
+  const missingUsernames = usernames.filter(u => !profileCache.has(`profile:${u.toLowerCase()}`));
+
+  // Cap at 15 NEW profiles per cycle to dodge Twitter's shadowban
+  const toFetch = missingUsernames.slice(0, 15);
+
+  const fetchOne = (u) =>
+    Promise.race([
+      getProfile(u),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('profile timeout')), 4_000)),
+    ]);
+
+  for (let i = 0; i < toFetch.length; i += batchSize) {
+    const batch = toFetch.slice(i, i + batchSize);
+    await Promise.allSettled(batch.map(fetchOne));
+  }
+
+  return tweets.map(tweet => {
+    // Pull from our 24-hour cache safely
+    const p = profileCache.get(`profile:${tweet.username?.toLowerCase()}`) || {};
+    return {
+      ...tweet,
+      // Fallback safely so it never hits null if the extraction caught it earlier
+      profileImage:   p.avatar         || tweet.profileImage || null,
+      displayName:    p.name           || tweet.displayName || tweet.username,
+      followersCount: p.followersCount ?? tweet.followersCount ?? 0,
+      isVerified:     p.isVerified     || tweet.isVerified || false,
+    };
+  });
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+export async function searchTweets(query, count = 20, mode = 'latest') {
+  const cacheKey = `search:${query}:${count}:${mode}`;
+  const cached   = tweetCache.get(cacheKey);
+  if (cached) return cached;
+
+  const searchMode = mode === 'top' ? SearchMode.Top : SearchMode.Latest;
+  const tweets     = [];
+
+  for await (const tweet of scraper.searchTweets(query, count, searchMode)) {
+    tweets.push(formatTweet(tweet));
+    if (tweets.length >= count) break;
+  }
+
+  const enriched = await enrichTweets(tweets);
+  tweetCache.set(cacheKey, enriched, TWEET_CACHE_TTL);
+  return enriched;
+}
+
+export async function getUserTweets(username, count = 20) {
+  const cacheKey = `user:${username.toLowerCase()}:${count}`;
+  const cached   = tweetCache.get(cacheKey);
+  if (cached) return cached;
+
+  const tweets = [];
+  for await (const tweet of scraper.getTweets(username, count)) {
+    tweets.push(formatTweet(tweet));
+    if (tweets.length >= count) break;
+  }
+
+  const enriched = await enrichTweets(tweets);
+  tweetCache.set(cacheKey, enriched, TWEET_CACHE_TTL);
+  return enriched;
+}
+
+export async function getMultiAccountFeed(accounts, perAccount = 5) {
+  const cacheKey = `feed:${accounts.join(',')}:${perAccount}`;
+  const cached   = tweetCache.get(cacheKey);
+  if (cached) return cached;
+
+  const results = await Promise.allSettled(accounts.map(a => getUserTweets(a, perAccount)));
+
+  const all = results
+    .filter(r => r.status === 'fulfilled')
+    .flatMap(r => r.value)
+    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+  tweetCache.set(cacheKey, all, TWEET_CACHE_TTL);
+  return all;
+}
+
+export async function getTrends() {
+  const cached = trendsCache.get('trends');
+  if (cached) return cached;
+
+  const trends = await scraper.getTrends();
+  trendsCache.set('trends', trends, TRENDS_CACHE_TTL);
+  return trends;
+}
+
+export async function getTrendingTweets(trendCount = 20, tweetsPerTrend = 3, mode = 'top') {
+  const cacheKey = `trending:${trendCount}:${tweetsPerTrend}:${mode}`;
+  const cached   = tweetCache.get(cacheKey);
+  if (cached) return cached;
+
+  const trends    = await getTrends();
+  const topTrends = trends.slice(0, trendCount);
+  const searchMode = mode === 'top' ? SearchMode.Top : SearchMode.Latest;
+
+  const BATCH = 5;
+  const all   = [];
+  for (let i = 0; i < topTrends.length; i += BATCH) {
+    const batch   = topTrends.slice(i, i + BATCH);
+    const results = await Promise.allSettled(
+      batch.map(async (trend) => {
+        const tweets = [];
+        for await (const tweet of scraper.searchTweets(trend, tweetsPerTrend, searchMode)) {
+          tweets.push({ ...formatTweet(tweet), trend });
+          if (tweets.length >= tweetsPerTrend) break;
+        }
+        return tweets;
+      })
+    );
+    results.filter(r => r.status === 'fulfilled').forEach(r => all.push(...r.value));
+  }
+
+  all.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  const enriched  = await enrichTweets(all);
+  const withTrend = enriched.map((t, i) => ({ ...t, trend: all[i]?.trend || '' }));
+
+  tweetCache.set(cacheKey, withTrend, TRENDS_CACHE_TTL);
+  return withTrend;
+}
+
+// ─── LIVE FIREHOSE BACKGROUND WORKER ──────────────────────────────────────────
+
+let backgroundRunning = false;
+
+// This runs silently in the background so the user never has to wait.
+async function runBackgroundFirehose() {
+  if (!ready) return;
+  if (backgroundRunning) {
+    return;
+  }
+  backgroundRunning = true;
+
+  try {
+    // Ensuring high quality by enforcing minimum engagement (min_faves:15)
+    // and premium accounts (filter:verified) to emulate creatememe.io tracking
+    const queries = [
+      '(crypto OR $SOL OR memecoin OR pump.fun OR dexscreener) filter:verified min_faves:15 -filter:replies',
+      '(AI OR OpenAI OR ChatGPT OR SpaceX OR robotics) filter:verified min_faves:15 -filter:replies',
+      '(breaking OR alert OR "just in" OR ceasefire OR war) filter:verified filter:media min_faves:15 -filter:replies'
+    ];
+
+    const allTweets = [];
+    const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
+
+    const results = await Promise.allSettled(
+      queries.map(async (query) => {
+        const out = [];
+        try {
+          let iterated = 0;
+          for await (const tweet of scraper.searchTweets(query, 25, SearchMode.Latest)) {
+            iterated++;
+            if (iterated > 25) break;
+            out.push(formatTweet(tweet));
+          }
+        } catch (err) {
+          console.error(`[Firehose] Error on query [${query.slice(0, 40)}]:`, err.message);
+        }
+        return out;
+      })
+    );
+
+    results
+      .filter(r => r.status === 'fulfilled')
+      .forEach(r => allTweets.push(...r.value));
+
+    // Deduplicate by id
+    const uniqueTweets = Array.from(
+      new Map(allTweets.filter(t => t && t.id).map(t => [t.id, t])).values()
+    );
+
+    // Keep tweets from the last hour
+    const freshTweets = uniqueTweets.filter(t => {
+      const tTime = t.timestamp || (t.timeParsed ? Math.floor(new Date(t.timeParsed).getTime() / 1000) : 0);
+      return tTime >= oneHourAgo;
+    });
+
+    const finalTweets = freshTweets.length > 0 ? freshTweets : uniqueTweets;
+
+    // Sort newest first
+    finalTweets.sort((a, b) => {
+      const timeA = a.timestamp || (a.timeParsed ? Math.floor(new Date(a.timeParsed).getTime() / 1000) : 0);
+      const timeB = b.timestamp || (b.timeParsed ? Math.floor(new Date(b.timeParsed).getTime() / 1000) : 0);
+      return timeB - timeA;
+    });
+
+    if (finalTweets.length > 0) {
+      const capped = finalTweets.slice(0, 60);
+
+      // Save raw immediately 
+      instantFirehoseData = capped;
+
+      try {
+        const enriched = await Promise.race([
+          enrichTweetsBatched(capped),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('enrich timeout')), 20_000)),
+        ]);
+        if (Array.isArray(enriched) && enriched.length > 0) {
+          instantFirehoseData = enriched;
+        }
+      } catch (e) {
+        console.warn(`⚠️ Enrichment failed/timed out: ${e.message} — keeping raw tweets.`);
+      }
+    }
+  } catch (err) {
+    console.error('❌ Background Worker Error:', err.message);
+  } finally {
+    backgroundRunning = false;
+  }
+}
+
+let fallbackInFlight = null;
+
+export async function getLiveFirehose(count = 30) {
+  if (instantFirehoseData.length > 0) {
+    return instantFirehoseData.slice(0, count);
+  }
+
+  if (fallbackInFlight) {
+    await fallbackInFlight;
+    return instantFirehoseData.slice(0, count);
+  }
+
+  fallbackInFlight = (async () => {
+    try {
+      const q = '(crypto OR solana OR news OR AI) filter:verified min_faves:15 -filter:replies';
+      const collected = [];
+
+      try {
+        let n = 0;
+        for await (const tweet of scraper.searchTweets(q, 40, SearchMode.Latest)) {
+          collected.push(formatTweet(tweet));
+          if (++n >= 40) break;
+        }
+      } catch (err) {
+        // ignore
+      }
+
+      const unique = Array.from(
+        new Map(collected.filter(t => t && t.id).map(t => [t.id, t])).values()
+      );
+      unique.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+      if (unique.length > 0) {
+        instantFirehoseData = unique;
+        try {
+          const enriched = await Promise.race([
+            enrichTweetsBatched(unique),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 20_000)),
+          ]);
+          if (Array.isArray(enriched) && enriched.length > 0) {
+            instantFirehoseData = enriched;
+          }
+        } catch (e) {}
+      }
+    } finally {
+      fallbackInFlight = null;
+    }
+  })();
+
+  await fallbackInFlight;
+  return instantFirehoseData.slice(0, count);
+}
+
+export function getFirehoseStatus() {
+  return {
+    cacheSize: instantFirehoseData.length,
+    ready,
+    sampleIds: instantFirehoseData.slice(0, 3).map(t => t.id),
+    latestTimestamp: instantFirehoseData[0]?.timestamp || null,
+  };
+}
+
+// ─── Cache maintenance ────────────────────────────────────────────────────────
+setInterval(() => {
+  profileCache.cleanup();
+  tweetCache.cleanup();
+  trendsCache.cleanup();
+}, 5 * 60_000);
