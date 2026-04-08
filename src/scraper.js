@@ -321,7 +321,32 @@ export async function getTrendingTweets(trendCount = 20, tweetsPerTrend = 3, mod
   tweetCache.set(cacheKey, withTrend, TRENDS_CACHE_TTL);
   return withTrend;
 }
+/**
+ * Simulate a Live Firehose by searching for brand new tweets from verified accounts,
+ * excluding replies to keep the feed clean and high-quality.
+ * @param {number} count Max tweets to return
+ */
+export async function getLiveFirehose(count = 30) {
+  const cacheKey = `live:firehose:${count}`;
+  const cached   = tweetCache.get(cacheKey);
+  if (cached) return cached;
 
+  // 'filter:verified' guarantees notable accounts across all niches.
+  // '-filter:replies' removes conversational threads.
+  const query = 'filter:verified -filter:replies';
+  const tweets = [];
+
+  for await (const tweet of scraper.searchTweets(query, count, SearchMode.Latest)) {
+    tweets.push(formatTweet(tweet));
+    if (tweets.length >= count) break;
+  }
+
+  const enriched = await enrichTweets(tweets);
+  
+  // Use a shorter TTL (15 seconds) for the live firehose so the dashboard feels truly "live"
+  tweetCache.set(cacheKey, enriched, 15_000); 
+  return enriched;
+}
 // ─── Cache maintenance ────────────────────────────────────────────────────────
 setInterval(() => {
   profileCache.cleanup();
