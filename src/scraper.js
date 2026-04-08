@@ -109,25 +109,64 @@ export async function getProfile(username) {
 // ─── Tweet helpers ────────────────────────────────────────────────────────────
 
 function formatTweet(tweet) {
+  // The scraper library uses a few different field names depending on version
+  // (likes/likeCount/favoriteCount, views/viewCount, etc). Try them all.
+  const likes =
+    tweet.likes ?? tweet.likeCount ?? tweet.favoriteCount ?? tweet.favorite_count ?? 0;
+  const retweets =
+    tweet.retweets ?? tweet.retweetCount ?? tweet.retweet_count ?? 0;
+  const replies =
+    tweet.replies ?? tweet.replyCount ?? tweet.reply_count ?? 0;
+  const views =
+    tweet.views ?? tweet.viewCount ?? tweet.view_count ?? 0;
+
+  // Some scraper versions embed user/author data directly on the tweet object
+  const embeddedUser = tweet.user || tweet.author || tweet.core?.user_results?.result?.legacy || {};
+  const embeddedAvatar =
+    embeddedUser.profile_image_url_https ||
+    embeddedUser.profile_image_url ||
+    embeddedUser.avatar ||
+    tweet.profileImageUrl ||
+    tweet.avatar ||
+    null;
+  const embeddedName =
+    embeddedUser.name ||
+    tweet.name ||
+    tweet.displayName ||
+    tweet.username ||
+    '';
+  const embeddedFollowers =
+    embeddedUser.followers_count ??
+    embeddedUser.followersCount ??
+    tweet.followersCount ??
+    0;
+  const embeddedVerified =
+    embeddedUser.verified ||
+    embeddedUser.is_blue_verified ||
+    tweet.isBlueVerified ||
+    tweet.isVerified ||
+    false;
+
   return {
-    id:           tweet.id            || null,
-    text:         tweet.text          || '',
-    username:     tweet.username      || '',
-    timestamp:    tweet.timestamp     || (tweet.timeParsed ? Math.floor(tweet.timeParsed.getTime() / 1000) : null),
+    id:           tweet.id            || tweet.id_str || tweet.rest_id || null,
+    text:         tweet.text          || tweet.full_text || '',
+    username:     tweet.username      || embeddedUser.screen_name || '',
+    timestamp:    tweet.timestamp     || (tweet.timeParsed ? Math.floor(new Date(tweet.timeParsed).getTime() / 1000) : null),
     timeParsed:   tweet.timeParsed    || null,
-    likes:        tweet.likes         ?? 0,
-    retweets:     tweet.retweets      ?? 0,
-    replies:      tweet.replies       ?? 0,
-    views:        tweet.views         ?? 0,
+    likes,
+    retweets,
+    replies,
+    views,
     photos:       tweet.photos        || [],
     videos:       tweet.videos        || [],
     permanentUrl: tweet.permanentUrl  || (tweet.id ? `https://x.com/${tweet.username}/status/${tweet.id}` : null),
     isRetweet:    tweet.isRetweet     || false,
     isReply:      tweet.isReply       || false,
-    profileImage:  null,
-    displayName:   tweet.username || '',
-    followersCount: 0,
-    isVerified:    false,
+    // Pre-populate from embedded user if present — enrichment will overwrite later
+    profileImage:   embeddedAvatar,
+    displayName:    embeddedName,
+    followersCount: embeddedFollowers,
+    isVerified:     embeddedVerified,
   };
 }
 
@@ -323,17 +362,20 @@ async function runBackgroundFirehose() {
     // but the loop does NOT break early on them — it keeps looking for newer ones.
     const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
 
+    // Use Top mode — Latest mode often returns 0 for likes/views on brand-new tweets
     const results = await Promise.allSettled(
       queries.map(async (query) => {
         const out = [];
         try {
           let iterated = 0;
-          for await (const tweet of scraper.searchTweets(query, 25, SearchMode.Latest)) {
+          for await (const tweet of scraper.searchTweets(query, 25, SearchMode.Top)) {
             iterated++;
-            if (iterated > 25) break; // safety
+            if (iterated > 25) break;
             out.push(formatTweet(tweet));
           }
-          console.log(`  ↳ [${query.slice(0, 40)}...] fetched ${out.length} tweets`);
+          const withLikes = out.filter(t => t.likes > 0).length;
+          const withViews = out.filter(t => t.views > 0).length;
+          console.log(`  ↳ [${query.slice(0, 40)}...] fetched ${out.length} (${withLikes} likes, ${withViews} views)`);
         } catch (err) {
           console.error(`[Firehose] Error on query [${query.slice(0, 40)}]:`, err.message);
         }
@@ -366,28 +408,26 @@ async function runBackgroundFirehose() {
     });
 
     if (finalTweets.length > 0) {
-      // 🔥 SAVE IMMEDIATELY (unenriched) so /api/live never returns empty.
-      // Enrichment was hanging on 75 concurrent profile fetches (rate-limited).
-      const capped = finalTweets.slice(0, 100);
-      instantFirehoseData = capped;
-      console.log(`✅ Background Worker: Saved ${capped.length} tweets (${freshTweets.length} fresh < 1h). Enriching in background...`);
+      const capped = finalTweets.slice(0, 60); // 60 is enough, keeps enrichment fast
 
-      // Fire-and-forget enrichment in the background with a timeout guard.
-      // If it succeeds, swap in the enriched version. If it hangs/fails, no harm done.
-      (async () => {
-        try {
-          const enriched = await Promise.race([
-            enrichTweetsBatched(capped),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('enrich timeout')), 15_000)),
-          ]);
-          if (Array.isArray(enriched) && enriched.length > 0) {
-            instantFirehoseData = enriched;
-            console.log(`🎨 Enrichment complete: ${enriched.length} tweets now have profile images.`);
-          }
-        } catch (e) {
-          console.warn(`⚠️ Enrichment skipped: ${e.message}`);
+      // Save raw immediately so /api/live never returns empty even if enrichment hangs
+      instantFirehoseData = capped;
+      console.log(`✅ Background Worker: Saved ${capped.length} raw tweets. Enriching...`);
+
+      // Now wait (with timeout) for enrichment so the cache has profile data
+      try {
+        const enriched = await Promise.race([
+          enrichTweetsBatched(capped),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('enrich timeout')), 20_000)),
+        ]);
+        if (Array.isArray(enriched) && enriched.length > 0) {
+          instantFirehoseData = enriched;
+          const withAvatars = enriched.filter(t => t.profileImage).length;
+          console.log(`🎨 Enriched ${enriched.length} tweets (${withAvatars} with avatars).`);
         }
-      })();
+      } catch (e) {
+        console.warn(`⚠️ Enrichment failed/timed out: ${e.message} — keeping raw tweets.`);
+      }
     } else {
       console.warn('⚠️ Background Worker: ALL queries returned 0 tweets. Twitter auth may be broken.');
     }
