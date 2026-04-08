@@ -20,6 +20,9 @@ let scraper     = null;
 let ready       = false;
 let initPromise = null;
 
+// 🔥 Global memory cache for instant responses
+let instantFirehoseData = [];
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function parseCookieString(raw) {
@@ -65,6 +68,11 @@ export async function initScraper() {
 
       if (ready) {
         console.log('✅ Twitter session active — scraper is ready');
+        
+        // 🔥 START THE BACKGROUND WORKER HERE 🔥
+        runBackgroundFirehose();
+        setInterval(runBackgroundFirehose, 30_000); // Polls Twitter every 30 seconds
+        
       } else {
         console.error('❌ Cookies loaded but session is invalid.');
       }
@@ -241,9 +249,8 @@ export async function getTrendingTweets(trendCount = 20, tweetsPerTrend = 3, mod
   return withTrend;
 }
 
-// ─── LIVE FIREHOSE ────────────────────────────────────────────────────────────
+// ─── LIVE FIREHOSE BACKGROUND WORKER ──────────────────────────────────────────
 
-// The Pro-Tier Alpha List (DECLARED ONLY ONCE HERE)
 const FIREHOSE_SOURCES = [
   "tier10k", "FirstSquawk", "unusual_whales", "WatcherGuru", "lookonchain",
   "Reuters", "BBCWorld", "aljazeeraenglish", "business", "Bloomberg", 
@@ -258,49 +265,53 @@ const FIREHOSE_SOURCES = [
   "fityeth", "Tezzo100x", "thuggies_sol"
 ];
 
-/**
- * The Curated Alpha Firehose (MEDIA ONLY)
- */
-export async function getLiveFirehose(count = 30) {
-  const cacheKey = `live:firehose:curated_media:${count}`;
-  const cached   = tweetCache.get(cacheKey);
-  if (cached) return cached;
+// This runs silently in the background so the user never has to wait.
+async function runBackgroundFirehose() {
+  if (!ready) return;
 
-  const uniqueSources = [...new Set(FIREHOSE_SOURCES)];
-  const chunkSize = 10;
-  const batches = [];
-  for (let i = 0; i < uniqueSources.length; i += chunkSize) {
-    batches.push(uniqueSources.slice(i, i + chunkSize));
-  }
+  console.log('🔄 Background Worker: Fetching fresh firehose tweets...');
+  try {
+    const uniqueSources = [...new Set(FIREHOSE_SOURCES)];
+    const chunkSize = 10;
+    const batches = [];
+    for (let i = 0; i < uniqueSources.length; i += chunkSize) {
+      batches.push(uniqueSources.slice(i, i + chunkSize));
+    }
 
-  const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
-  const allTweets = [];
+    const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
+    const allTweets = [];
 
-  for (const batch of batches) {
-    const fromQuery = batch.map(user => `from:${user}`).join(' OR ');
-    const query = `(${fromQuery}) filter:media -filter:replies`;
+    for (const batch of batches) {
+      const fromQuery = batch.map(user => `from:${user}`).join(' OR ');
+      const query = `(${fromQuery}) filter:media -filter:replies`;
 
-    try {
       for await (const tweet of scraper.searchTweets(query, 20, SearchMode.Latest)) {
         if (tweet.timestamp && tweet.timestamp < oneHourAgo) {
           break; 
         }
         allTweets.push(formatTweet(tweet));
       }
-    } catch (err) {
-      console.error(`[Firehose] Batch error for query [${query}]:`, err.message);
     }
+
+    const uniqueTweets = Array.from(new Map(allTweets.map(t => [t.id, t])).values());
+    uniqueTweets.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    const lastHourTweets = uniqueTweets.filter(t => t.timestamp && t.timestamp >= oneHourAgo);
+    
+    // Save the finalized data to the global variable
+    instantFirehoseData = await enrichTweets(lastHourTweets);
+    console.log(`✅ Background Worker: Saved ${instantFirehoseData.length} new tweets to memory.`);
+  } catch (err) {
+    console.error('❌ Background Worker Error:', err.message);
   }
+}
 
-  const uniqueTweets = Array.from(new Map(allTweets.map(t => [t.id, t])).values());
-  uniqueTweets.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-
-  const lastHourTweets = uniqueTweets.filter(t => t.timestamp && t.timestamp >= oneHourAgo);
-  const finalTweets = lastHourTweets.slice(0, count);
-  const enriched = await enrichTweets(finalTweets);
-  
-  tweetCache.set(cacheKey, enriched, 15_000); 
-  return enriched;
+/**
+ * The Curated Alpha Firehose (MEDIA ONLY)
+ * NOW INSTANT: Returns the pre-fetched data from the background worker in 1 millisecond.
+ */
+export async function getLiveFirehose(count = 30) {
+  // Return the data instantly, no waiting for Twitter!
+  return instantFirehoseData.slice(0, count);
 }
 
 // ─── Cache maintenance ────────────────────────────────────────────────────────
