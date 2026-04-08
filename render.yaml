@@ -1,0 +1,75 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# render.yaml — One-click deploy to Render.com
+#
+# How to deploy:
+#   1. Push this repo to GitHub (or GitLab)
+#   2. Go to https://dashboard.render.com → New → Blueprint
+#   3. Connect your repo — Render reads this file automatically
+#   4. Fill in the env vars marked  sync: false  in the Render dashboard
+#   5. Click "Apply"
+#
+# After first deploy:
+#   • Check the Render logs — the server will print a base64 string labelled
+#     "TWITTER_COOKIES".  Copy it and paste it into the TWITTER_COOKIES env var
+#     in the Render dashboard, then redeploy.  This prevents re-login on every
+#     cold-start, which reduces the risk of your Twitter account getting banned.
+#
+# Keep-alive (prevent spin-down on free tier):
+#   • Sign up at https://uptimerobot.com (free)
+#   • Add a new HTTP monitor pointing to:
+#       https://<your-service>.onrender.com/health
+#   • Set interval to 5 minutes
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+  - type: web
+    name: twitter-tracker-api
+    runtime: node
+    plan: free                        # free tier — 750 hrs/month, spins down after 15 min idle
+
+    # Build
+    buildCommand: npm install
+
+    # Start
+    startCommand: node src/server.js
+
+    # Health check — Render uses this to know the service is up
+    healthCheckPath: /health
+
+    # Auto-deploy when you push to the connected branch
+    autoDeploy: true
+
+    envVars:
+      # ── Node ────────────────────────────────────────────────────────────────
+      - key: NODE_ENV
+        value: production
+
+      - key: PORT
+        value: 3000
+
+      # ── Twitter credentials (set these in the Render dashboard) ─────────────
+      #    TWITTER_COOKIES   → preferred: base64 string printed on first login
+      #    TWITTER_USERNAME  → fallback when TWITTER_COOKIES is missing/expired
+      #    TWITTER_PASSWORD  → fallback
+      #    TWITTER_EMAIL     → optional but reduces 2FA friction
+
+      - key: TWITTER_COOKIES
+        sync: false           # ← paste the base64 cookie string here after first run
+
+      - key: TWITTER_USERNAME
+        sync: false           # ← throwaway Twitter account username
+
+      - key: TWITTER_PASSWORD
+        sync: false           # ← throwaway Twitter account password
+
+      - key: TWITTER_EMAIL
+        sync: false           # ← email used to register the account (optional)
+
+      # ── API protection ──────────────────────────────────────────────────────
+      #    Set this to any random secret string.
+      #    Your frontend/Supabase Edge Function must send:
+      #      Authorization: Bearer <API_SECRET>
+      #    Leave blank to make the API open (not recommended for production).
+
+      - key: API_SECRET
+        sync: false           # ← generate with: openssl rand -hex 32
