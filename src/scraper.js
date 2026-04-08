@@ -274,10 +274,11 @@ async function runBackgroundFirehose() {
     // Broad, high-volume queries. NO filter:verified (too restrictive),
     // NO filter:media, NO strict time cutoff. Just recent tweets from
     // high-activity topics.
+    // Removed lang:en — some scraper builds don't support it and silently return 0.
     const queries = [
-      '(crypto OR bitcoin OR $SOL OR memecoin OR "pump.fun" OR dexscreener OR ethereum) -filter:replies lang:en',
-      '(AI OR OpenAI OR ChatGPT OR SpaceX OR elon OR tech) -filter:replies lang:en',
-      '(breaking OR "just in" OR news OR alert) -filter:replies lang:en',
+      '(crypto OR bitcoin OR $SOL OR memecoin OR ethereum OR solana) -filter:replies',
+      '(AI OR OpenAI OR ChatGPT OR elon OR SpaceX) -filter:replies',
+      '(breaking OR "just in" OR news) -filter:replies',
     ];
 
     const allTweets = [];
@@ -338,12 +339,67 @@ async function runBackgroundFirehose() {
   }
 }
 /**
- * The Curated Alpha Firehose (MEDIA ONLY)
- * NOW INSTANT: Returns the pre-fetched data from the background worker in 1 millisecond.
+ * Live firehose — returns recent tweets across all topics.
+ * If background worker has populated the cache, returns instantly.
+ * Otherwise does a SYNCHRONOUS fallback search so the endpoint never returns empty.
  */
 export async function getLiveFirehose(count = 30) {
-  // Return the data instantly, no waiting for Twitter!
-  return instantFirehoseData.slice(0, count);
+  // Fast path: background worker has data
+  if (instantFirehoseData.length > 0) {
+    return instantFirehoseData.slice(0, count);
+  }
+
+  // Fallback: do a live search directly. This guarantees we return data
+  // even on the very first request before the background worker finishes.
+  console.log('⚡ getLiveFirehose: cache empty, doing live fallback search...');
+
+  const fallbackQueries = [
+    '(crypto OR bitcoin OR solana OR memecoin) -filter:replies',
+    '(breaking OR news OR AI) -filter:replies',
+  ];
+
+  const collected = [];
+  for (const q of fallbackQueries) {
+    try {
+      let n = 0;
+      for await (const tweet of scraper.searchTweets(q, 20, SearchMode.Latest)) {
+        collected.push(formatTweet(tweet));
+        if (++n >= 20) break;
+      }
+    } catch (err) {
+      console.error(`[getLiveFirehose fallback] query [${q}] failed:`, err.message);
+    }
+    if (collected.length >= count) break;
+  }
+
+  // Deduplicate
+  const unique = Array.from(
+    new Map(collected.filter(t => t && t.id).map(t => [t.id, t])).values()
+  );
+
+  unique.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+  const enriched = await enrichTweets(unique.slice(0, count));
+
+  // Populate the cache so next call is instant
+  if (enriched.length > 0) {
+    instantFirehoseData = enriched;
+    console.log(`⚡ Fallback saved ${enriched.length} tweets to cache.`);
+  }
+
+  return enriched;
+}
+
+/**
+ * Debug: returns the current state of the firehose cache.
+ */
+export function getFirehoseStatus() {
+  return {
+    cacheSize: instantFirehoseData.length,
+    ready,
+    sampleIds: instantFirehoseData.slice(0, 3).map(t => t.id),
+    latestTimestamp: instantFirehoseData[0]?.timestamp || null,
+  };
 }
 
 // ─── Cache maintenance ────────────────────────────────────────────────────────

@@ -28,7 +28,8 @@ import {
   getMultiAccountFeed,
   getTrends,
   getTrendingTweets,
-  getLiveFirehose
+  getLiveFirehose,
+  getFirehoseStatus
 } from './scraper.js';
 
 // ─── App setup ────────────────────────────────────────────────────────────────
@@ -288,6 +289,21 @@ app.get('/api/trending', requireAuth, scraperGuard, async (req, res) => {
     console.error('[/api/trending]', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+/**
+ * GET /api/debug — no auth, shows internal state for troubleshooting
+ */
+app.get('/api/debug', (_req, res) => {
+  res.json({
+    ready: isReady(),
+    firehose: getFirehoseStatus(),
+    env: {
+      hasCookies: !!process.env.TWITTER_COOKIES,
+      hasSecret:  !!process.env.API_SECRET,
+    },
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // ─── 404 fallback ─────────────────────────────────────────────────────────────
