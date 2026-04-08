@@ -341,9 +341,17 @@ const FIREHOSE_SOURCES = [
   "fityeth", "Tezzo100x", "thuggies_sol"
 ];
 
+// Prevents overlapping background worker runs (if previous run hangs, skip new one)
+let backgroundRunning = false;
+
 // This runs silently in the background so the user never has to wait.
 async function runBackgroundFirehose() {
   if (!ready) return;
+  if (backgroundRunning) {
+    console.log('⏭  Background Worker: previous run still in progress, skipping.');
+    return;
+  }
+  backgroundRunning = true;
 
   console.log('🔄 Background Worker: Fetching live feed...');
   try {
@@ -362,20 +370,20 @@ async function runBackgroundFirehose() {
     // but the loop does NOT break early on them — it keeps looking for newer ones.
     const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
 
-    // Use Top mode — Latest mode often returns 0 for likes/views on brand-new tweets
+    // Back to Latest — Top mode hangs in this scraper version
     const results = await Promise.allSettled(
       queries.map(async (query) => {
         const out = [];
         try {
           let iterated = 0;
-          for await (const tweet of scraper.searchTweets(query, 25, SearchMode.Top)) {
+          for await (const tweet of scraper.searchTweets(query, 25, SearchMode.Latest)) {
             iterated++;
             if (iterated > 25) break;
             out.push(formatTweet(tweet));
           }
           const withLikes = out.filter(t => t.likes > 0).length;
           const withViews = out.filter(t => t.views > 0).length;
-          console.log(`  ↳ [${query.slice(0, 40)}...] fetched ${out.length} (${withLikes} likes, ${withViews} views)`);
+          console.log(`  ↳ [${query.slice(0, 40)}...] fetched ${out.length} (${withLikes}L ${withViews}V)`);
         } catch (err) {
           console.error(`[Firehose] Error on query [${query.slice(0, 40)}]:`, err.message);
         }
@@ -433,73 +441,78 @@ async function runBackgroundFirehose() {
     }
   } catch (err) {
     console.error('❌ Background Worker Error:', err.message, err.stack);
+  } finally {
+    backgroundRunning = false;
   }
 }
 /**
  * Live firehose — returns recent tweets across all topics.
  * If background worker has populated the cache, returns instantly.
- * Otherwise does a SYNCHRONOUS fallback search so the endpoint never returns empty.
+ * Otherwise a SINGLE-FLIGHT fallback search runs so 20 concurrent
+ * requests don't trigger 20 concurrent Twitter searches (which hang).
  */
+let fallbackInFlight = null;
+
 export async function getLiveFirehose(count = 30) {
-  // Fast path: background worker has data
+  // Fast path: background worker (or previous fallback) has populated cache
   if (instantFirehoseData.length > 0) {
     return instantFirehoseData.slice(0, count);
   }
 
-  // Fallback: do a live search directly. This guarantees we return data
-  // even on the very first request before the background worker finishes.
-  console.log('⚡ getLiveFirehose: cache empty, doing live fallback search...');
+  // Single-flight: if a fallback is already running, await it instead of starting a new one
+  if (fallbackInFlight) {
+    await fallbackInFlight;
+    return instantFirehoseData.slice(0, count);
+  }
 
-  const fallbackQueries = [
-    '(crypto OR bitcoin OR solana OR memecoin) -filter:replies',
-    '(breaking OR news OR AI) -filter:replies',
-  ];
+  console.log('⚡ getLiveFirehose: cache empty, running ONE fallback search (single-flight)...');
 
-  const collected = [];
-  for (const q of fallbackQueries) {
+  fallbackInFlight = (async () => {
     try {
-      let n = 0;
-      for await (const tweet of scraper.searchTweets(q, 20, SearchMode.Latest)) {
-        collected.push(formatTweet(tweet));
-        if (++n >= 20) break;
-      }
-    } catch (err) {
-      console.error(`[getLiveFirehose fallback] query [${q}] failed:`, err.message);
-    }
-    if (collected.length >= count) break;
-  }
+      const q = '(crypto OR bitcoin OR solana OR news OR AI) -filter:replies';
+      const collected = [];
 
-  // Deduplicate
-  const unique = Array.from(
-    new Map(collected.filter(t => t && t.id).map(t => [t.id, t])).values()
-  );
-
-  unique.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-
-  // Return unenriched tweets immediately (no rate-limit hang risk)
-  const capped = unique.slice(0, count);
-
-  if (capped.length > 0) {
-    instantFirehoseData = capped;
-    console.log(`⚡ Fallback saved ${capped.length} tweets to cache.`);
-
-    // Enrich in background with timeout — next call will get the enriched version
-    (async () => {
       try {
-        const enriched = await Promise.race([
-          enrichTweetsBatched(capped),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('enrich timeout')), 15_000)),
-        ]);
-        if (Array.isArray(enriched) && enriched.length > 0) {
-          instantFirehoseData = enriched;
+        let n = 0;
+        for await (const tweet of scraper.searchTweets(q, 40, SearchMode.Latest)) {
+          collected.push(formatTweet(tweet));
+          if (++n >= 40) break;
         }
-      } catch (e) {
-        console.warn(`[fallback enrichment] skipped: ${e.message}`);
+      } catch (err) {
+        console.error(`[fallback search] failed:`, err.message);
       }
-    })();
-  }
 
-  return capped;
+      const unique = Array.from(
+        new Map(collected.filter(t => t && t.id).map(t => [t.id, t])).values()
+      );
+      unique.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+      if (unique.length > 0) {
+        instantFirehoseData = unique;
+        console.log(`⚡ Fallback saved ${unique.length} raw tweets. Enriching...`);
+
+        try {
+          const enriched = await Promise.race([
+            enrichTweetsBatched(unique),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 20_000)),
+          ]);
+          if (Array.isArray(enriched) && enriched.length > 0) {
+            instantFirehoseData = enriched;
+            console.log(`🎨 Fallback enriched ${enriched.length} tweets.`);
+          }
+        } catch (e) {
+          console.warn(`[fallback enrichment] skipped: ${e.message}`);
+        }
+      } else {
+        console.warn('⚡ Fallback returned 0 tweets.');
+      }
+    } finally {
+      fallbackInFlight = null;
+    }
+  })();
+
+  await fallbackInFlight;
+  return instantFirehoseData.slice(0, count);
 }
 
 /**
