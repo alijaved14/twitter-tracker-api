@@ -154,6 +154,43 @@ async function enrichTweets(tweets) {
   });
 }
 
+/**
+ * Batched enrichment — fetches profiles 5 at a time instead of all at once,
+ * with a per-profile timeout. Used by the background firehose to avoid
+ * rate-limit hangs on large batches.
+ */
+async function enrichTweetsBatched(tweets, batchSize = 5) {
+  const usernames = [...new Set(tweets.map(t => t.username).filter(Boolean))];
+  const profileMap = {};
+
+  const fetchOne = (u) =>
+    Promise.race([
+      getProfile(u),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('profile timeout')), 4_000)),
+    ]);
+
+  for (let i = 0; i < usernames.length; i += batchSize) {
+    const batch = usernames.slice(i, i + batchSize);
+    const results = await Promise.allSettled(batch.map(fetchOne));
+    batch.forEach((u, idx) => {
+      if (results[idx].status === 'fulfilled') {
+        profileMap[u.toLowerCase()] = results[idx].value;
+      }
+    });
+  }
+
+  return tweets.map(tweet => {
+    const p = profileMap[tweet.username?.toLowerCase()] || {};
+    return {
+      ...tweet,
+      profileImage:   p.avatar         || tweet.profileImage || null,
+      displayName:    p.name           || tweet.username,
+      followersCount: p.followersCount ?? 0,
+      isVerified:     p.isVerified     || false,
+    };
+  });
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export async function searchTweets(query, count = 20, mode = 'latest') {
@@ -329,8 +366,28 @@ async function runBackgroundFirehose() {
     });
 
     if (finalTweets.length > 0) {
-      instantFirehoseData = await enrichTweets(finalTweets.slice(0, 100));
-      console.log(`✅ Background Worker: Saved ${instantFirehoseData.length} tweets (${freshTweets.length} fresh < 1h).`);
+      // 🔥 SAVE IMMEDIATELY (unenriched) so /api/live never returns empty.
+      // Enrichment was hanging on 75 concurrent profile fetches (rate-limited).
+      const capped = finalTweets.slice(0, 100);
+      instantFirehoseData = capped;
+      console.log(`✅ Background Worker: Saved ${capped.length} tweets (${freshTweets.length} fresh < 1h). Enriching in background...`);
+
+      // Fire-and-forget enrichment in the background with a timeout guard.
+      // If it succeeds, swap in the enriched version. If it hangs/fails, no harm done.
+      (async () => {
+        try {
+          const enriched = await Promise.race([
+            enrichTweetsBatched(capped),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('enrich timeout')), 15_000)),
+          ]);
+          if (Array.isArray(enriched) && enriched.length > 0) {
+            instantFirehoseData = enriched;
+            console.log(`🎨 Enrichment complete: ${enriched.length} tweets now have profile images.`);
+          }
+        } catch (e) {
+          console.warn(`⚠️ Enrichment skipped: ${e.message}`);
+        }
+      })();
     } else {
       console.warn('⚠️ Background Worker: ALL queries returned 0 tweets. Twitter auth may be broken.');
     }
@@ -379,15 +436,30 @@ export async function getLiveFirehose(count = 30) {
 
   unique.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
-  const enriched = await enrichTweets(unique.slice(0, count));
+  // Return unenriched tweets immediately (no rate-limit hang risk)
+  const capped = unique.slice(0, count);
 
-  // Populate the cache so next call is instant
-  if (enriched.length > 0) {
-    instantFirehoseData = enriched;
-    console.log(`⚡ Fallback saved ${enriched.length} tweets to cache.`);
+  if (capped.length > 0) {
+    instantFirehoseData = capped;
+    console.log(`⚡ Fallback saved ${capped.length} tweets to cache.`);
+
+    // Enrich in background with timeout — next call will get the enriched version
+    (async () => {
+      try {
+        const enriched = await Promise.race([
+          enrichTweetsBatched(capped),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('enrich timeout')), 15_000)),
+        ]);
+        if (Array.isArray(enriched) && enriched.length > 0) {
+          instantFirehoseData = enriched;
+        }
+      } catch (e) {
+        console.warn(`[fallback enrichment] skipped: ${e.message}`);
+      }
+    })();
   }
 
-  return enriched;
+  return capped;
 }
 
 /**
