@@ -322,65 +322,65 @@ export async function getTrendingTweets(trendCount = 20, tweetsPerTrend = 3, mod
   return withTrend;
 }
 /**
- * Simulate a Live Firehose by searching for brand new tweets from verified accounts,
- * excluding replies to keep the feed clean and high-quality.
- * @param {number} count Max tweets to return
- */
-/**
- * Simulate a Live Firehose by searching for brand new tweets from verified accounts,
- * excluding replies, AND requiring minimum engagement to filter out $8 spam accounts.
- * @param {number} count Max tweets to return
- */
-/**
- * Simulate a Live Firehose by merging a general high-engagement feed
- * with a targeted VIP feed (Elon, Trump, ETH founder, SOL founder).
+ * The "Narrative & Meta" Firehose
+ * Catches viral memes (animals, news, pop culture), VIP tweets (Elon, Trump), 
+ * and crypto narrative discussions BEFORE or AS they become memecoins.
  * @param {number} count Max tweets to return
  */
 export async function getLiveFirehose(count = 30) {
-  const cacheKey = `live:firehose:mixed:${count}`;
+  const cacheKey = `live:firehose:narrative:${count}`;
   const cached   = tweetCache.get(cacheKey);
   if (cached) return cached;
 
-  // Stream 1: The General Global Firehose (High quality, verified, no replies)
-  const generalQuery = 'filter:verified min_faves:20 -filter:replies';
-
-  // Stream 2: The VIP / Crypto Query 
-  // 'from:...' gets their actual tweets. The text in quotes gets tweets *about* them.
-  const vipQuery = '(from:elonmusk OR from:realDonaldTrump OR from:VitalikButerin OR from:aeyakovenko OR "Donald Trump" OR "Elon Musk" OR "Solana") min_faves:15 -filter:replies';
-
-  // Helper function to fetch a specific query
+  // Helper function to fetch streams safely
   const fetchTweets = async (query, max) => {
     const results = [];
-    for await (const tweet of scraper.searchTweets(query, max, SearchMode.Latest)) {
-      results.push(formatTweet(tweet));
-      if (results.length >= max) break;
+    try {
+      for await (const tweet of scraper.searchTweets(query, max, SearchMode.Latest)) {
+        results.push(formatTweet(tweet));
+        if (results.length >= max) break;
+      }
+    } catch (err) {
+      console.error(`Error fetching stream [${query}]:`, err.message);
     }
     return results;
   };
 
-  // Fetch both streams simultaneously so the API stays fast
-  // We grab half the requested count from General, and half from VIP
-  const halfCount = Math.ceil(count / 2);
-  const [generalTweets, vipTweets] = await Promise.all([
-    fetchTweets(generalQuery, halfCount),
-    fetchTweets(vipQuery, halfCount)
+  // ─── STREAM 1: THE META-MAKERS (Instant Coin Spawners) ───
+  // Anything these accounts post can instantly spawn a coin.
+  const vipQuery = '(from:elonmusk OR from:realDonaldTrump OR from:cb_doge OR from:VitalikButerin) -filter:replies';
+
+  // ─── STREAM 2: EXTREME VIRALITY (The Monkeys & Penguins) ───
+  // Huge engagement + contains an image/video. This is where organic memes are born.
+  const viralQuery = 'filter:verified min_faves:10000 filter:media -filter:replies';
+
+  // ─── STREAM 3: CRYPTO META-SPOTTERS ───
+  // Crypto Twitter actively discussing the next trend.
+  const metaQuery = '("new meta" OR "the meta" OR "narrative" OR "next narrative") (memecoin OR $SOL OR crypto) min_faves:30 -filter:replies';
+
+  // Fetch all three streams simultaneously to keep the API fast
+  const perStream = Math.ceil(count / 3);
+  const [vips, virals, metas] = await Promise.all([
+    fetchTweets(vipQuery, perStream),
+    fetchTweets(viralQuery, perStream),
+    fetchTweets(metaQuery, perStream)
   ]);
 
-  // Merge the two streams together
-  const allTweets = [...generalTweets, ...vipTweets];
+  // Merge the streams
+  const allTweets = [...vips, ...virals, ...metas];
 
-  // Remove any duplicates (in case a VIP tweet was also caught in the general firehose)
+  // Deduplicate (just in case streams overlap)
   const uniqueTweets = Array.from(new Map(allTweets.map(t => [t.id, t])).values());
 
-  // Sort them by timestamp so the feed flows naturally (newest first)
+  // Sort by timestamp so the feed reads naturally (newest first)
   uniqueTweets.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
-  // Trim to the exact count requested and enrich with profile data
+  // Trim to exact count and enrich with profile pictures/data
   const finalTweets = uniqueTweets.slice(0, count);
   const enriched = await enrichTweets(finalTweets);
   
-  // Cache for 15 seconds to keep it "Live"
-  tweetCache.set(cacheKey, enriched, 15_000); 
+  // Cache for 20 seconds
+  tweetCache.set(cacheKey, enriched, 20_000); 
   return enriched;
 }
 // ─── Cache maintenance ────────────────────────────────────────────────────────
