@@ -326,14 +326,20 @@ export async function getTrendingTweets(trendCount = 20, tweetsPerTrend = 3, mod
  * excluding replies to keep the feed clean and high-quality.
  * @param {number} count Max tweets to return
  */
+/**
+ * Simulate a Live Firehose by searching for brand new tweets from verified accounts,
+ * excluding replies, AND requiring minimum engagement to filter out $8 spam accounts.
+ * @param {number} count Max tweets to return
+ */
 export async function getLiveFirehose(count = 30) {
   const cacheKey = `live:firehose:${count}`;
   const cached   = tweetCache.get(cacheKey);
   if (cached) return cached;
 
-  // 'filter:verified' guarantees notable accounts across all niches.
-  // '-filter:replies' removes conversational threads.
-  const query = 'filter:verified -filter:replies';
+  // THE FIX: Added 'min_faves:20'
+  // This guarantees we only get tweets that are actually popping off right now, 
+  // wiping out the 0-like spam you were seeing before.
+  const query = 'filter:verified min_faves:20 -filter:replies';
   const tweets = [];
 
   for await (const tweet of scraper.searchTweets(query, count, SearchMode.Latest)) {
@@ -343,7 +349,7 @@ export async function getLiveFirehose(count = 30) {
 
   const enriched = await enrichTweets(tweets);
   
-  // Use a shorter TTL (15 seconds) for the live firehose so the dashboard feels truly "live"
+  // Use a shorter TTL (15 seconds) so the dashboard updates frequently
   tweetCache.set(cacheKey, enriched, 15_000); 
   return enriched;
 }
