@@ -28,6 +28,7 @@ import {
   getMultiAccountFeed,
   getTrends,
   getTrendingTweets,
+  getLiveFirehose
 } from './scraper.js';
 
 // ─── App setup ────────────────────────────────────────────────────────────────
@@ -80,7 +81,21 @@ function parseCount(raw, max = 50, fallback = 20) {
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
+/**
+ * GET /api/live
+ * Live firehose of recent tweets from verified accounts across all topics globally.
+ */
+app.get('/api/live', requireAuth, scraperGuard, async (req, res) => {
+  const { count } = req.query;
 
+  try {
+    const tweets = await getLiveFirehose(parseCount(count, 50, 30));
+    res.json({ success: true, count: tweets.length, tweets });
+  } catch (err) {
+    console.error('[/api/live]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 /**
  * GET /health
  * Used by UptimeRobot (ping every 5 min to prevent Render spin-down).
