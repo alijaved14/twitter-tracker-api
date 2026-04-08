@@ -321,10 +321,11 @@ export async function getTrendingTweets(trendCount = 20, tweetsPerTrend = 3, mod
   tweetCache.set(cacheKey, withTrend, TRENDS_CACHE_TTL);
   return withTrend;
 }
+
+
 /**
  * The "Narrative & Meta" Firehose
- * Catches viral memes (animals, news, pop culture), VIP tweets (Elon, Trump), 
- * and crypto narrative discussions BEFORE or AS they become memecoins.
+ * Catches viral memes (animals, news), VIP tweets, and crypto narratives.
  * @param {number} count Max tweets to return
  */
 export async function getLiveFirehose(count = 30) {
@@ -332,11 +333,11 @@ export async function getLiveFirehose(count = 30) {
   const cached   = tweetCache.get(cacheKey);
   if (cached) return cached;
 
-  // Helper function to fetch streams safely
-  const fetchTweets = async (query, max) => {
+  // FIX 1: We added 'mode' as a parameter so we can switch between Latest and Top
+  const fetchTweets = async (query, max, mode = SearchMode.Latest) => {
     const results = [];
     try {
-      for await (const tweet of scraper.searchTweets(query, max, SearchMode.Latest)) {
+      for await (const tweet of scraper.searchTweets(query, max, mode)) {
         results.push(formatTweet(tweet));
         if (results.length >= max) break;
       }
@@ -346,36 +347,32 @@ export async function getLiveFirehose(count = 30) {
     return results;
   };
 
-  // ─── STREAM 1: THE META-MAKERS (Instant Coin Spawners) ───
-  // Anything these accounts post can instantly spawn a coin.
-  const vipQuery = '(from:elonmusk OR from:realDonaldTrump OR from:cb_doge OR from:VitalikButerin) -filter:replies';
-
-  // ─── STREAM 2: EXTREME VIRALITY (The Monkeys & Penguins) ───
-  // Huge engagement + contains an image/video. This is where organic memes are born.
-  const viralQuery = 'filter:verified min_faves:10000 filter:media -filter:replies';
-
-  // ─── STREAM 3: CRYPTO META-SPOTTERS ───
-  // Crypto Twitter actively discussing the next trend.
-  const metaQuery = '("new meta" OR "the meta" OR "narrative" OR "next narrative") (memecoin OR $SOL OR crypto) min_faves:30 -filter:replies';
-
-  // Fetch all three streams simultaneously to keep the API fast
   const perStream = Math.ceil(count / 3);
-  const [vips, virals, metas] = await Promise.all([
-    fetchTweets(vipQuery, perStream),
-    fetchTweets(viralQuery, perStream),
-    fetchTweets(metaQuery, perStream)
-  ]);
+
+  // ─── STREAM 1: THE META-MAKERS (Use Latest) ───
+  const vipQuery = '(from:elonmusk OR from:realDonaldTrump OR from:cb_doge OR from:VitalikButerin) -filter:replies';
+  // FIX 2: Await sequentially to avoid hitting Twitter's concurrent rate limits
+  const vips = await fetchTweets(vipQuery, perStream, SearchMode.Latest);
+
+  // ─── STREAM 2: EXTREME VIRALITY (MUST use Top) ───
+  // Lowered to 5k to catch things as they rise. We MUST use SearchMode.Top here.
+  const viralQuery = 'filter:verified min_faves:5000 filter:media -filter:replies';
+  const virals = await fetchTweets(viralQuery, perStream, SearchMode.Top);
+
+  // ─── STREAM 3: CRYPTO META-SPOTTERS (Use Latest, lower threshold) ───
+  const metaQuery = '("new meta" OR "the meta" OR "narrative" OR "next narrative") (memecoin OR $SOL OR crypto) min_faves:10 -filter:replies';
+  const metas = await fetchTweets(metaQuery, perStream, SearchMode.Latest);
 
   // Merge the streams
   const allTweets = [...vips, ...virals, ...metas];
 
-  // Deduplicate (just in case streams overlap)
+  // Deduplicate
   const uniqueTweets = Array.from(new Map(allTweets.map(t => [t.id, t])).values());
 
   // Sort by timestamp so the feed reads naturally (newest first)
   uniqueTweets.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
-  // Trim to exact count and enrich with profile pictures/data
+  // Trim to exact count and enrich
   const finalTweets = uniqueTweets.slice(0, count);
   const enriched = await enrichTweets(finalTweets);
   
