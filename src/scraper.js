@@ -331,25 +331,55 @@ export async function getTrendingTweets(trendCount = 20, tweetsPerTrend = 3, mod
  * excluding replies, AND requiring minimum engagement to filter out $8 spam accounts.
  * @param {number} count Max tweets to return
  */
+/**
+ * Simulate a Live Firehose by merging a general high-engagement feed
+ * with a targeted VIP feed (Elon, Trump, ETH founder, SOL founder).
+ * @param {number} count Max tweets to return
+ */
 export async function getLiveFirehose(count = 30) {
-  const cacheKey = `live:firehose:${count}`;
+  const cacheKey = `live:firehose:mixed:${count}`;
   const cached   = tweetCache.get(cacheKey);
   if (cached) return cached;
 
-  // THE FIX: Added 'min_faves:20'
-  // This guarantees we only get tweets that are actually popping off right now, 
-  // wiping out the 0-like spam you were seeing before.
-  const query = 'filter:verified min_faves:20 -filter:replies';
-  const tweets = [];
+  // Stream 1: The General Global Firehose (High quality, verified, no replies)
+  const generalQuery = 'filter:verified min_faves:20 -filter:replies';
 
-  for await (const tweet of scraper.searchTweets(query, count, SearchMode.Latest)) {
-    tweets.push(formatTweet(tweet));
-    if (tweets.length >= count) break;
-  }
+  // Stream 2: The VIP / Crypto Query 
+  // 'from:...' gets their actual tweets. The text in quotes gets tweets *about* them.
+  const vipQuery = '(from:elonmusk OR from:realDonaldTrump OR from:VitalikButerin OR from:aeyakovenko OR "Donald Trump" OR "Elon Musk" OR "Solana") min_faves:15 -filter:replies';
 
-  const enriched = await enrichTweets(tweets);
+  // Helper function to fetch a specific query
+  const fetchTweets = async (query, max) => {
+    const results = [];
+    for await (const tweet of scraper.searchTweets(query, max, SearchMode.Latest)) {
+      results.push(formatTweet(tweet));
+      if (results.length >= max) break;
+    }
+    return results;
+  };
+
+  // Fetch both streams simultaneously so the API stays fast
+  // We grab half the requested count from General, and half from VIP
+  const halfCount = Math.ceil(count / 2);
+  const [generalTweets, vipTweets] = await Promise.all([
+    fetchTweets(generalQuery, halfCount),
+    fetchTweets(vipQuery, halfCount)
+  ]);
+
+  // Merge the two streams together
+  const allTweets = [...generalTweets, ...vipTweets];
+
+  // Remove any duplicates (in case a VIP tweet was also caught in the general firehose)
+  const uniqueTweets = Array.from(new Map(allTweets.map(t => [t.id, t])).values());
+
+  // Sort them by timestamp so the feed flows naturally (newest first)
+  uniqueTweets.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+  // Trim to the exact count requested and enrich with profile data
+  const finalTweets = uniqueTweets.slice(0, count);
+  const enriched = await enrichTweets(finalTweets);
   
-  // Use a shorter TTL (15 seconds) so the dashboard updates frequently
+  // Cache for 15 seconds to keep it "Live"
   tweetCache.set(cacheKey, enriched, 15_000); 
   return enriched;
 }
