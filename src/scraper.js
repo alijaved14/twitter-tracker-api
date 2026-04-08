@@ -115,17 +115,22 @@ export async function getProfile(username) {
 }
 
 // ─── Tweet helpers ────────────────────────────────────────────────────────────
-
 function formatTweet(tweet) {
+  // Standardize engagement stats
   const likes = tweet.likes ?? tweet.likeCount ?? tweet.favoriteCount ?? tweet.favorite_count ?? 0;
   const retweets = tweet.retweets ?? tweet.retweetCount ?? tweet.retweet_count ?? 0;
   const replies = tweet.replies ?? tweet.replyCount ?? tweet.reply_count ?? 0;
   const views = tweet.views ?? tweet.viewCount ?? tweet.view_count ?? 0;
 
+  // Extract deeply nested user data directly from the tweet to avoid API calls
   const user = tweet.user || tweet.author || {};
   const legacy = tweet.core?.user_results?.result?.legacy || user.legacy || {};
   const result = tweet.core?.user_results?.result || user.result || {};
 
+  const username = tweet.username || user.screen_name || legacy.screen_name || '';
+
+  // 🔥 SURGICAL FIX: Add unavatar directly to the raw formatter so it never returns null,
+  // even if the enrichment fallback completely times out.
   const embeddedAvatar =
     tweet.profileImageUrl ||
     tweet.avatar ||
@@ -133,14 +138,14 @@ function formatTweet(tweet) {
     user.profile_image_url ||
     legacy.profile_image_url_https ||
     result.profile_image_url_https ||
-    null;
+    `https://unavatar.io/x/${username}`;
 
   const embeddedName =
     tweet.name ||
     tweet.displayName ||
     user.name ||
     legacy.name ||
-    tweet.username ||
+    username ||
     '';
 
   const embeddedFollowers =
@@ -161,7 +166,7 @@ function formatTweet(tweet) {
   return {
     id:           tweet.id || tweet.id_str || tweet.rest_id || null,
     text:         tweet.text || tweet.full_text || '',
-    username:     tweet.username || user.screen_name || legacy.screen_name || '',
+    username:     username,
     timestamp:    tweet.timestamp || (tweet.timeParsed ? Math.floor(new Date(tweet.timeParsed).getTime() / 1000) : null),
     timeParsed:   tweet.timeParsed || null,
     likes,
@@ -170,9 +175,10 @@ function formatTweet(tweet) {
     views,
     photos:       tweet.photos || [],
     videos:       tweet.videos || [],
-    permanentUrl: tweet.permanentUrl || (tweet.id ? `https://x.com/${tweet.username}/status/${tweet.id}` : null),
+    permanentUrl: tweet.permanentUrl || (tweet.id ? `https://x.com/${username}/status/${tweet.id}` : null),
     isRetweet:    tweet.isRetweet || false,
     isReply:      tweet.isReply || false,
+    
     profileImage:   embeddedAvatar,
     displayName:    embeddedName,
     followersCount: embeddedFollowers,
