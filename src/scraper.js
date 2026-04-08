@@ -324,60 +324,37 @@ export async function getTrendingTweets(trendCount = 20, tweetsPerTrend = 3, mod
 
 
 /**
- * The "Narrative & Meta" Firehose
- * Catches viral memes (animals, news), VIP tweets, and crypto narratives.
+ * The "Ultra-Fast Alpha" Firehose
+ * One single, highly optimized query to fetch VIPs, narratives, and crypto launches instantly.
  * @param {number} count Max tweets to return
  */
 export async function getLiveFirehose(count = 30) {
-  const cacheKey = `live:firehose:narrative:${count}`;
+  const cacheKey = `live:firehose:fast:${count}`;
   const cached   = tweetCache.get(cacheKey);
   if (cached) return cached;
 
-  // FIX 1: We added 'mode' as a parameter so we can switch between Latest and Top
-  const fetchTweets = async (query, max, mode = SearchMode.Latest) => {
-    const results = [];
-    try {
-      for await (const tweet of scraper.searchTweets(query, max, mode)) {
-        results.push(formatTweet(tweet));
-        if (results.length >= max) break;
-      }
-    } catch (err) {
-      console.error(`Error fetching stream [${query}]:`, err.message);
-    }
-    return results;
-  };
-
-  const perStream = Math.ceil(count / 3);
-
-  // ─── STREAM 1: THE META-MAKERS (Use Latest) ───
-  const vipQuery = '(from:elonmusk OR from:realDonaldTrump OR from:cb_doge OR from:VitalikButerin) -filter:replies';
-  // FIX 2: Await sequentially to avoid hitting Twitter's concurrent rate limits
-  const vips = await fetchTweets(vipQuery, perStream, SearchMode.Latest);
-
-  // ─── STREAM 2: EXTREME VIRALITY (MUST use Top) ───
-  // Lowered to 5k to catch things as they rise. We MUST use SearchMode.Top here.
-  const viralQuery = 'filter:verified min_faves:5000 filter:media -filter:replies';
-  const virals = await fetchTweets(viralQuery, perStream, SearchMode.Top);
-
-  // ─── STREAM 3: CRYPTO META-SPOTTERS (Use Latest, lower threshold) ───
-  const metaQuery = '("new meta" OR "the meta" OR "narrative" OR "next narrative") (memecoin OR $SOL OR crypto) min_faves:10 -filter:replies';
-  const metas = await fetchTweets(metaQuery, perStream, SearchMode.Latest);
-
-  // Merge the streams
-  const allTweets = [...vips, ...virals, ...metas];
-
-  // Deduplicate
-  const uniqueTweets = Array.from(new Map(allTweets.map(t => [t.id, t])).values());
-
-  // Sort by timestamp so the feed reads naturally (newest first)
-  uniqueTweets.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-
-  // Trim to exact count and enrich
-  const finalTweets = uniqueTweets.slice(0, count);
-  const enriched = await enrichTweets(finalTweets);
+  // ─── THE MASTER QUERY ───
+  // We combine VIPs, crypto platforms, and narrative keywords into ONE search.
+  // We set min_faves:5. This is the magic number: it filters out 0-like bot spam,
+  // but is low enough to catch viral tweets seconds/minutes after they are posted.
+  const query = '(from:elonmusk OR from:realDonaldTrump OR from:VitalikButerin OR "pump.fun" OR "dexscreener" OR memecoin OR "new meta") min_faves:5 -filter:replies';
   
-  // Cache for 20 seconds
-  tweetCache.set(cacheKey, enriched, 20_000); 
+  const tweets = [];
+
+  try {
+    // SearchMode.Latest + a single query = blazing fast execution
+    for await (const tweet of scraper.searchTweets(query, count, SearchMode.Latest)) {
+      tweets.push(formatTweet(tweet));
+      if (tweets.length >= count) break;
+    }
+  } catch (err) {
+    console.error('[/api/live] Search error:', err.message);
+  }
+
+  const enriched = await enrichTweets(tweets);
+  
+  // Cache for just 10 seconds to keep the feed feeling ultra real-time
+  tweetCache.set(cacheKey, enriched, 10_000); 
   return enriched;
 }
 // ─── Cache maintenance ────────────────────────────────────────────────────────
