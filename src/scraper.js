@@ -395,6 +395,32 @@ const FIREHOSE_SOURCES = [
   "fityeth", "Tezzo100x", "thuggies_sol"
 ];
 
+// ─── Live Firehose ────────────────────────────────────────────────────────────
+
+// The Pro-Tier Alpha List
+const FIREHOSE_SOURCES = [
+  // 🚨 BREAKING / FASTEST (ALPHA CORE)
+  "tier10k", "FirstSquawk", "unusual_whales", "WatcherGuru", "lookonchain",
+  // 📰 GLOBAL NEWS (HIGH TRUST)
+  "Reuters", "BBCWorld", "aljazeeraenglish", "business", "Bloomberg", 
+  "TimesNow", "TheBlock__", "CoinDesk", "WuBlockchain",
+  // 🪙 CRYPTO CORE (MARKET MOVING)
+  "BitcoinNews", "cz_binance", "VitalikButerin", "Saylor", 
+  "brian_armstrong", "nayibbukele",
+  // 🧠 SMART MONEY / ANALYSTS
+  "EricBalchunas", "APompliano", "RaoulGMI", "novogratz", "Pentosh1",
+  // 🔍 ON-CHAIN / INSIDER SIGNAL
+  "ArkhamIntel", "nansen_ai", "glassnode", "CryptoQuant_com",
+  // ⚡ CURATORS / AGGREGATORS
+  "zerohedge", "db_news",
+  // 🤖 TECH / AI / STARTUP
+  "elonmusk", "sama", "pmarca", "naval", "levelsio", "paulg",
+  // 🌍 VIRAL / OPINION / DISTRIBUTION
+  "DrewPavlou", "dom_lucre", "wholemars", "BoredElonMusk",
+  // 🎯 OPTIONAL MEME / DEGEN FLOW
+  "fityeth", "Tezzo100x", "thuggies_sol"
+];
+
 /**
  * The Curated Alpha Firehose (MEDIA ONLY)
  * Loops through curated accounts, fetching ONLY tweets from the last hour
@@ -456,6 +482,13 @@ export async function getLiveFirehose(count = 30) {
   tweetCache.set(cacheKey, enriched, 15_000); 
   return enriched;
 }
+
+// ─── Cache maintenance ────────────────────────────────────────────────────────
+setInterval(() => {
+  profileCache.cleanup();
+  tweetCache.cleanup();
+  trendsCache.cleanup();
+}, 5 * 60_000);
 
 // ─── Cache maintenance ────────────────────────────────────────────────────────
 setInterval(() => {
