@@ -30,6 +30,8 @@ function parseCookieString(raw) {
 }
 
 // ─── Syndication API Helpers (No Auth / High Limits) ─────────────────────────
+
+// 1. Get Avatars from Embed CDN
 function getSyndicationToken(tweetId) {
   return ((Number(tweetId) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
 }
@@ -39,7 +41,6 @@ async function fetchSyndicationProfile(tweetId) {
     const token = getSyndicationToken(tweetId);
     const url = `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&token=${token}`;
     
-    // fetch from Twitter's public CDN — completely bypasses auth and IP bans
     const res = await fetch(url);
     if (!res.ok) return null;
     
@@ -51,11 +52,37 @@ async function fetchSyndicationProfile(tweetId) {
       username: user.screen_name,
       name: user.name,
       avatar: user.profile_image_url_https?.replace('_normal', ''),
-      followersCount: user.followers_count || 0,
+      // The embed API often omits follower count, so we don't force a default 0 here anymore
+      followersCount: user.followers_count, 
       isVerified: user.is_blue_verified || user.verified || false,
     };
   } catch (err) {
     return null;
+  }
+}
+
+// 2. Get Follower Counts from Follow Button CDN (Batch Request)
+async function fetchSyndicationFollowers(usernames) {
+  if (!usernames || usernames.length === 0) return {};
+  try {
+    const counts = {};
+    // Chunk requests into 50 users at a time to be safe
+    for (let i = 0; i < usernames.length; i += 50) {
+      const chunk = usernames.slice(i, i + 50).join(',');
+      const url = `https://cdn.syndication.twimg.com/widgets/followbutton/info.json?screen_names=${chunk}`;
+      
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      
+      const data = await res.json();
+      for (const u of data) {
+        counts[u.screen_name.toLowerCase()] = u.followers_count;
+      }
+    }
+    return counts;
+  } catch (err) {
+    console.warn('[SyndicationFollowers] Error fetching batch follower counts', err.message);
+    return {};
   }
 }
 
@@ -145,7 +172,7 @@ export async function getProfile(username) {
   try {
     // 1. Try standard scraper first
     const res = await scraper.getProfile(username);
-    const p = res?.value || res; // Handle library wrapper if present
+    const p = res?.value || res; 
     
     if (p && p.username) {
       const formatted = {
@@ -168,7 +195,10 @@ export async function getProfile(username) {
     for await (const tweet of tweetsIter) {
       if (tweet.id) {
         const profile = await fetchSyndicationProfile(tweet.id);
+        const followerData = await fetchSyndicationFollowers([username]);
+        
         if (profile) {
+           profile.followersCount = followerData[username.toLowerCase()] ?? profile.followersCount ?? 0;
            profileCache.set(key, profile, PROFILE_CACHE_TTL);
            return profile;
         }
@@ -251,11 +281,16 @@ function formatTweet(tweet) {
 }
 
 async function enrichTweets(tweets) {
+  // 1. Gather all unique usernames for a batch follower-count lookup
+  const uniqueUsernames = [...new Set(tweets.map(t => t.username).filter(Boolean))];
+  const followerData = await fetchSyndicationFollowers(uniqueUsernames);
+
   return Promise.all(tweets.map(async (tweet) => {
-    const cacheKey = `profile:${tweet.username?.toLowerCase()}`;
+    const unameLower = tweet.username?.toLowerCase();
+    const cacheKey = `profile:${unameLower}`;
     let profile = profileCache.get(cacheKey);
 
-    // If not cached, fetch via public CDN using the Tweet ID
+    // 2. If not cached, fetch avatar via public CDN using the Tweet ID
     if (!profile && tweet.id) {
       profile = await fetchSyndicationProfile(tweet.id);
       if (profile) {
@@ -263,17 +298,29 @@ async function enrichTweets(tweets) {
       }
     }
 
+    // 3. Resolve the highest-priority follower count available
+    // Batch API > Cached Profile > Embedded Tweet Data > 0
+    const realFollowers = followerData[unameLower] 
+                          ?? profile?.followersCount 
+                          ?? tweet.followersCount 
+                          ?? 0;
+
+    // Save back to cache so we don't keep polling
+    if (profile && realFollowers > 0) {
+      profile.followersCount = realFollowers;
+      profileCache.set(cacheKey, profile, PROFILE_CACHE_TTL);
+    }
+
     return {
       ...tweet,
       profileImage:   profile?.avatar         || tweet.profileImage || null,
       displayName:    profile?.name           || tweet.displayName  || tweet.username,
-      followersCount: profile?.followersCount ?? tweet.followersCount ?? 0,
+      followersCount: realFollowers,
       isVerified:     profile?.isVerified     || tweet.isVerified   || false,
     };
   }));
 }
 
-// Syndication is so fast we don't need a separate batched strategy anymore
 async function enrichTweetsBatched(tweets) {
   return enrichTweets(tweets);
 }
