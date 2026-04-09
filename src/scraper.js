@@ -86,6 +86,40 @@ export async function initScraper() {
 
 export const isReady = () => ready;
 
+// ─── Profile image from Twitter page ─────────────────────────────────────────
+
+async function fetchProfileImageFromPage(username) {
+  try {
+    const cookies = await scraper.getCookies();
+    const cookieStr = cookies.map(c => `${c.key}=${c.value}`).join('; ');
+
+    const res = await fetch(`https://x.com/${username}/photo`, {
+      headers: {
+        Cookie: cookieStr,
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!res.ok) return null;
+    const html = await res.text();
+
+    // og:image is the most reliable signal in SSR HTML
+    const ogMatch = html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/);
+    if (ogMatch) return ogMatch[1];
+
+    // Direct pbs.twimg.com profile_images src as fallback
+    const srcMatch = html.match(/src="(https:\/\/pbs\.twimg\.com\/profile_images\/[^"]+)"/);
+    if (srcMatch) return srcMatch[1];
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Profile ─────────────────────────────────────────────────────────────────
 
 export async function getProfile(username) {
@@ -95,8 +129,14 @@ export async function getProfile(username) {
 
   try {
     const p = await scraper.getProfile(username);
-    
-    const avatarUrl = p.avatar || p.profileImageUrl || p.profile_image_url_https || null;
+
+    let avatarUrl = p.avatar || p.profileImageUrl || p.profile_image_url_https || null;
+
+    // If the scraper didn't return an avatar, try scraping the profile page
+    if (!avatarUrl) {
+      avatarUrl = await fetchProfileImageFromPage(username);
+    }
+
     const followers = p.followersCount ?? p.followers_count ?? 0;
 
     const formatted = {
@@ -110,6 +150,19 @@ export async function getProfile(username) {
     profileCache.set(key, formatted, PROFILE_CACHE_TTL);
     return formatted;
   } catch (err) {
+    // API call failed — try the page scrape directly
+    const avatarUrl = await fetchProfileImageFromPage(username);
+    if (avatarUrl) {
+      const formatted = {
+        username,
+        name:           username,
+        avatar:         avatarUrl,
+        followersCount: 0,
+        isVerified:     false,
+      };
+      profileCache.set(key, formatted, PROFILE_CACHE_TTL);
+      return formatted;
+    }
     throw new Error(`Profile fetch failed for ${username}`);
   }
 }
@@ -138,7 +191,7 @@ function formatTweet(tweet) {
     user.profile_image_url ||
     legacy.profile_image_url_https ||
     result.profile_image_url_https ||
-    `https://unavatar.io/x/${username}`;
+    null;
 
   const embeddedName =
     tweet.name ||
@@ -205,8 +258,7 @@ async function enrichTweets(tweets) {
     const p = profileCache.get(`profile:${tweet.username?.toLowerCase()}`) || {};
     return {
       ...tweet,
-      // 🔥 SURGICAL FIX: If the scraper fails, instantly inject a dynamic Unavatar link!
-      profileImage:   p.avatar || tweet.profileImage || `https://unavatar.io/x/${tweet.username}`,
+      profileImage:   p.avatar || tweet.profileImage || null,
       displayName:    p.name || tweet.displayName || tweet.username,
       followersCount: p.followersCount ?? tweet.followersCount ?? 0,
       isVerified:     p.isVerified || tweet.isVerified || false,
@@ -246,9 +298,8 @@ async function enrichTweetsBatched(tweets, batchSize = 5) {
     const p = profileCache.get(`profile:${tweet.username?.toLowerCase()}`) || {};
     return {
       ...tweet,
-      profileImage:   p.avatar || tweet.profileImage || `https://unavatar.io/x/${tweet.username}`,
+      profileImage:   p.avatar || tweet.profileImage || null,
       displayName:    p.name || tweet.displayName || tweet.username,
-      // 🔴 FIX: Will now correctly populate followers for all users
       followersCount: p.followersCount ?? tweet.followersCount ?? 0,
       isVerified:     p.isVerified || tweet.isVerified || false,
     };
@@ -316,19 +367,19 @@ export async function getTrends() {
   return trends;
 }
 
-export async function getTrendingTweets(trendCount = 20, tweetsPerTrend = 3, mode = 'top') {
-  const cacheKey = `trending:${trendCount}:${tweetsPerTrend}:${mode}`;
+export async function getTrendingTweets(tweetsPerTrend = 2, mode = 'top', totalLimit = 10) {
+  const cacheKey = `trending:${tweetsPerTrend}:${mode}:${totalLimit}`;
   const cached   = tweetCache.get(cacheKey);
   if (cached) return cached;
 
-  const trends    = await getTrends();
-  const topTrends = trends.slice(0, trendCount);
+  const trends     = await getTrends();
   const searchMode = mode === 'top' ? SearchMode.Top : SearchMode.Latest;
 
   const BATCH = 5;
   const all   = [];
-  for (let i = 0; i < topTrends.length; i += BATCH) {
-    const batch   = topTrends.slice(i, i + BATCH);
+
+  for (let i = 0; i < trends.length && all.length < totalLimit; i += BATCH) {
+    const batch   = trends.slice(i, i + BATCH);
     const results = await Promise.allSettled(
       batch.map(async (trend) => {
         const tweets = [];
@@ -343,8 +394,9 @@ export async function getTrendingTweets(trendCount = 20, tweetsPerTrend = 3, mod
   }
 
   all.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-  const enriched  = await enrichTweets(all);
-  const withTrend = enriched.map((t, i) => ({ ...t, trend: all[i]?.trend || '' }));
+  const limited   = all.slice(0, totalLimit);
+  const enriched  = await enrichTweets(limited);
+  const withTrend = enriched.map((t, i) => ({ ...t, trend: limited[i]?.trend || '' }));
 
   tweetCache.set(cacheKey, withTrend, TRENDS_CACHE_TTL);
   return withTrend;

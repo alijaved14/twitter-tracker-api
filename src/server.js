@@ -256,32 +256,23 @@ app.get('/api/trends', requireAuth, scraperGuard, async (_req, res) => {
 
 /**
  * GET /api/trending
- * Returns tweets from ALL current trending topics on Twitter globally.
+ * Returns the top 10 tweets across current trending topics on Twitter globally.
  *
  * Query params:
- *   topics  {number}  How many trending topics to use (1–20, default all)
- *   per     {number}  Tweets per topic (1–10, default 3)
- *   mode    {string}  'latest'|'top' (default: 'top')
+ *   per   {number}  Tweets per trend (1–5, default 2)
+ *   mode  {string}  'latest'|'top' (default: 'top')
  *
  * Example: /api/trending
- * Example: /api/trending?topics=10&per=5
+ * Example: /api/trending?per=2&mode=top
  */
 app.get('/api/trending', requireAuth, scraperGuard, async (req, res) => {
-  const { topics, per = 3, mode = 'top' } = req.query;
-
-  const tweetsPerTrend = Math.min(Math.max(parseInt(per, 10) || 3, 1), 10);
+  const { per = 2, mode = 'top' } = req.query;
+  const tweetsPerTrend = Math.min(Math.max(parseInt(per, 10) || 2, 1), 5);
 
   try {
-    // Fetch all current trends first
-    const allTrends  = await getTrends();
-    const trendCount = topics
-      ? Math.min(Math.max(parseInt(topics, 10) || allTrends.length, 1), 20)
-      : allTrends.length;
-
-    const tweets = await getTrendingTweets(trendCount, tweetsPerTrend, mode);
+    const tweets = await getTrendingTweets(tweetsPerTrend, mode, 10);
     res.json({
       success: true,
-      trendingTopics: allTrends.slice(0, trendCount),
       count: tweets.length,
       tweets,
     });
