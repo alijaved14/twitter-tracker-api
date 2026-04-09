@@ -29,6 +29,36 @@ function parseCookieString(raw) {
   return raw.split(';').map(s => Cookie.parse(s.trim())).filter(Boolean);
 }
 
+// ─── Syndication API Helpers (No Auth / High Limits) ─────────────────────────
+function getSyndicationToken(tweetId) {
+  return ((Number(tweetId) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
+}
+
+async function fetchSyndicationProfile(tweetId) {
+  try {
+    const token = getSyndicationToken(tweetId);
+    const url = `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&token=${token}`;
+    
+    // fetch from Twitter's public CDN — completely bypasses auth and IP bans
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    
+    const data = await res.json();
+    const user = data.user;
+    if (!user) return null;
+
+    return {
+      username: user.screen_name,
+      name: user.name,
+      avatar: user.profile_image_url_https?.replace('_normal', ''),
+      followersCount: user.followers_count || 0,
+      isVerified: user.is_blue_verified || user.verified || false,
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
 // ─── Init / Auth ─────────────────────────────────────────────────────────────
 
 export async function initScraper() {
@@ -38,46 +68,65 @@ export async function initScraper() {
     scraper = new Scraper();
     const cookieEnv = process.env.TWITTER_COOKIES;
 
-    if (!cookieEnv || !cookieEnv.trim()) {
-      console.error('❌ TWITTER_COOKIES env var is not set.');
-      return;
-    }
-
     try {
-      let cookiesToSet;
-      try {
-        const decoded = Buffer.from(cookieEnv.trim(), 'base64').toString('utf8');
-        const arr     = JSON.parse(decoded);
-        if (Array.isArray(arr)) {
-          cookiesToSet = arr.map(c => Cookie.parse(c)).filter(Boolean);
-          console.log('🍪 Loaded cookies from base64 JSON format');
-        } else {
-          throw new Error('not an array');
+      if (!cookieEnv || !cookieEnv.trim()) {
+        console.warn('⚠️ TWITTER_COOKIES env var is not set. Attempting fresh login...');
+        
+        if (!process.env.TWITTER_USERNAME || !process.env.TWITTER_PASSWORD) {
+          throw new Error('TWITTER_USERNAME and TWITTER_PASSWORD must be set if cookies are empty.');
         }
-      } catch {
-        cookiesToSet = parseCookieString(cookieEnv.trim());
-        console.log('🍪 Loaded cookies from plain string format');
-      }
 
-      if (!cookiesToSet.length) {
-        throw new Error('No valid cookies could be parsed from TWITTER_COOKIES');
-      }
+        await scraper.login(
+          process.env.TWITTER_USERNAME,
+          process.env.TWITTER_PASSWORD,
+          process.env.TWITTER_EMAIL
+        );
+        
+        const cookies = await scraper.getCookies();
+        const cookieStrings = cookies.map(c => c.toString());
+        const base64Cookies = Buffer.from(JSON.stringify(cookieStrings)).toString('base64');
+        
+        console.log('\n========================================================================');
+        console.log('✅ FRESH LOGIN SUCCESSFUL!');
+        console.log('🚨 Copy the string below and paste it into TWITTER_COOKIES in Render:');
+        console.log('\n' + base64Cookies + '\n');
+        console.log('========================================================================\n');
+        
+        ready = await scraper.isLoggedIn();
+      } else {
+        // Load existing cookies
+        let cookiesToSet;
+        try {
+          const decoded = Buffer.from(cookieEnv.trim(), 'base64').toString('utf8');
+          const arr     = JSON.parse(decoded);
+          if (Array.isArray(arr)) {
+            cookiesToSet = arr.map(c => Cookie.parse(c)).filter(Boolean);
+            console.log('🍪 Loaded cookies from base64 JSON format');
+          } else {
+            throw new Error('not an array');
+          }
+        } catch {
+          cookiesToSet = parseCookieString(cookieEnv.trim());
+          console.log('🍪 Loaded cookies from plain string format');
+        }
 
-      await scraper.setCookies(cookiesToSet);
-      ready = await scraper.isLoggedIn();
+        if (!cookiesToSet.length) {
+          throw new Error('No valid cookies could be parsed from TWITTER_COOKIES');
+        }
+
+        await scraper.setCookies(cookiesToSet);
+        ready = await scraper.isLoggedIn();
+      }
 
       if (ready) {
         console.log('✅ Twitter session active — scraper is ready');
-        
         runBackgroundFirehose();
-        // Set to 60 seconds to prevent 503 Rate Limit errors from Twitter
         setInterval(runBackgroundFirehose, 60_000); 
-        
       } else {
-        console.error('❌ Cookies loaded but session is invalid.');
+        console.error('❌ Authentication failed. Session is invalid.');
       }
     } catch (err) {
-      console.error('❌ Failed to load cookies:', err.message);
+      console.error('❌ Init Error:', err.message);
     }
   })();
 
@@ -86,79 +135,6 @@ export async function initScraper() {
 
 export const isReady = () => ready;
 
-// ─── Twitter v1.1 bearer token (public web-client token) ─────────────────────
-// Used alongside session cookies to call the v1.1 REST API.
-const TWITTER_WEB_BEARER =
-  'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
-
-/**
- * Batch-fetch up to 100 Twitter profiles in a single v1.1 users/lookup request.
- * Uses the authenticated session cookies — no extra auth needed.
- * Returns a map of { lowercaseUsername → { username, name, avatar, followersCount, isVerified } }.
- */
-async function batchFetchProfiles(usernames) {
-  if (!usernames.length) return {};
-
-  try {
-    const cookies   = await scraper.getCookies();
-    const cookieStr = cookies.map(c => `${c.key}=${c.value}`).join('; ');
-    const ct0       = cookies.find(c => c.key === 'ct0')?.value || '';
-
-    const profileMap = {};
-
-    // v1.1 users/lookup accepts up to 100 screen_names per request
-    for (let i = 0; i < usernames.length; i += 100) {
-      const chunk = usernames.slice(i, i + 100);
-      const res = await fetch(
-        `https://api.twitter.com/1.1/users/lookup.json?screen_name=${chunk.join(',')}&include_entities=false`,
-        {
-          headers: {
-            Authorization:          `Bearer ${TWITTER_WEB_BEARER}`,
-            'x-csrf-token':         ct0,
-            Cookie:                 cookieStr,
-            'x-twitter-auth-type':  'OAuth2Session',
-            'x-twitter-active-user':'yes',
-            'User-Agent':           'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            Accept:                 'application/json',
-          },
-          signal: AbortSignal.timeout(8000),
-        }
-      );
-
-      if (!res.ok) {
-        console.warn(`[batchFetchProfiles] HTTP ${res.status} — ${await res.text().catch(() => '')}`);
-        continue;
-      }
-
-      const users = await res.json();
-      if (!Array.isArray(users)) {
-        console.warn('[batchFetchProfiles] unexpected shape:', JSON.stringify(users).slice(0, 200));
-        continue;
-      }
-
-      for (const user of users) {
-        const key = user.screen_name?.toLowerCase();
-        if (!key) continue;
-        const profile = {
-          username:       user.screen_name,
-          name:           user.name || user.screen_name,
-          // Remove _normal suffix to get original-size image
-          avatar:         user.profile_image_url_https?.replace('_normal', '') || null,
-          followersCount: user.followers_count || 0,
-          isVerified:     user.verified || false,
-        };
-        profileMap[key] = profile;
-        profileCache.set(`profile:${key}`, profile, PROFILE_CACHE_TTL);
-      }
-    }
-
-    return profileMap;
-  } catch (err) {
-    console.warn('[batchFetchProfiles] error:', err.message);
-    return {};
-  }
-}
-
 // ─── Profile ─────────────────────────────────────────────────────────────────
 
 export async function getProfile(username) {
@@ -166,36 +142,53 @@ export async function getProfile(username) {
   const cached = profileCache.get(key);
   if (cached) return cached;
 
-  // Primary: scraper's GraphQL UserByScreenName
   try {
-    const p = await scraper.getProfile(username);
-    const formatted = {
-      username:       p.username       || username,
-      name:           p.name           || username,
-      avatar:         p.avatar         || null,
-      followersCount: p.followersCount || 0,
-      isVerified:     p.isBlueVerified || p.isVerified || false,
-    };
-    profileCache.set(key, formatted, PROFILE_CACHE_TTL);
-    return formatted;
-  } catch {
-    // Fallback: v1.1 batch lookup (single-user batch)
-    const profiles = await batchFetchProfiles([username]);
-    const p = profiles[username.toLowerCase()];
-    if (p) return p; // already cached inside batchFetchProfiles
-    throw new Error(`Profile fetch failed for ${username}`);
+    // 1. Try standard scraper first
+    const res = await scraper.getProfile(username);
+    const p = res?.value || res; // Handle library wrapper if present
+    
+    if (p && p.username) {
+      const formatted = {
+        username:       p.username,
+        name:           p.name,
+        avatar:         p.avatar,
+        followersCount: p.followersCount || 0,
+        isVerified:     p.isBlueVerified || p.isVerified || false,
+      };
+      profileCache.set(key, formatted, PROFILE_CACHE_TTL);
+      return formatted;
+    }
+  } catch (err) {
+    console.warn(`[getProfile] Scraper failed for ${username}, trying syndication fallback...`);
   }
+
+  // 2. Fallback: Grab their latest tweet and extract profile via Syndication
+  try {
+    const tweetsIter = scraper.getTweets(username, 1);
+    for await (const tweet of tweetsIter) {
+      if (tweet.id) {
+        const profile = await fetchSyndicationProfile(tweet.id);
+        if (profile) {
+           profileCache.set(key, profile, PROFILE_CACHE_TTL);
+           return profile;
+        }
+      }
+    }
+  } catch (e) {
+     // Ignore
+  }
+
+  throw new Error(`Profile fetch failed for ${username}`);
 }
 
 // ─── Tweet helpers ────────────────────────────────────────────────────────────
+
 function formatTweet(tweet) {
-  // Standardize engagement stats
   const likes = tweet.likes ?? tweet.likeCount ?? tweet.favoriteCount ?? tweet.favorite_count ?? 0;
   const retweets = tweet.retweets ?? tweet.retweetCount ?? tweet.retweet_count ?? 0;
   const replies = tweet.replies ?? tweet.replyCount ?? tweet.reply_count ?? 0;
   const views = tweet.views ?? tweet.viewCount ?? tweet.view_count ?? 0;
 
-  // Extract deeply nested user data directly from the tweet to avoid API calls
   const user = tweet.user || tweet.author || {};
   const legacy = tweet.core?.user_results?.result?.legacy || user.legacy || {};
   const result = tweet.core?.user_results?.result || user.result || {};
@@ -257,41 +250,32 @@ function formatTweet(tweet) {
   };
 }
 
-function applyProfilesToTweets(tweets) {
-  return tweets.map(tweet => {
-    const p = profileCache.get(`profile:${tweet.username?.toLowerCase()}`) || {};
+async function enrichTweets(tweets) {
+  return Promise.all(tweets.map(async (tweet) => {
+    const cacheKey = `profile:${tweet.username?.toLowerCase()}`;
+    let profile = profileCache.get(cacheKey);
+
+    // If not cached, fetch via public CDN using the Tweet ID
+    if (!profile && tweet.id) {
+      profile = await fetchSyndicationProfile(tweet.id);
+      if (profile) {
+        profileCache.set(cacheKey, profile, PROFILE_CACHE_TTL);
+      }
+    }
+
     return {
       ...tweet,
-      profileImage:   p.avatar         || tweet.profileImage || null,
-      displayName:    p.name           || tweet.displayName  || tweet.username,
-      followersCount: p.followersCount ?? tweet.followersCount ?? 0,
-      isVerified:     p.isVerified     || tweet.isVerified   || false,
+      profileImage:   profile?.avatar         || tweet.profileImage || null,
+      displayName:    profile?.name           || tweet.displayName  || tweet.username,
+      followersCount: profile?.followersCount ?? tweet.followersCount ?? 0,
+      isVerified:     profile?.isVerified     || tweet.isVerified   || false,
     };
-  });
+  }));
 }
 
-async function enrichTweets(tweets) {
-  const usernames       = [...new Set(tweets.map(t => t.username).filter(Boolean))];
-  const missingUsernames = usernames.filter(u => !profileCache.has(`profile:${u.toLowerCase()}`));
-
-  if (missingUsernames.length > 0) {
-    // One batch request for ALL missing users (up to 100 per call)
-    await batchFetchProfiles(missingUsernames);
-  }
-
-  return applyProfilesToTweets(tweets);
-}
-
+// Syndication is so fast we don't need a separate batched strategy anymore
 async function enrichTweetsBatched(tweets) {
-  const usernames       = [...new Set(tweets.map(t => t.username).filter(Boolean))];
-  const missingUsernames = usernames.filter(u => !profileCache.has(`profile:${u.toLowerCase()}`));
-
-  if (missingUsernames.length > 0) {
-    // Batch v1.1 lookup handles up to 100 per call — no looping needed for typical firehose sizes
-    await batchFetchProfiles(missingUsernames);
-  }
-
-  return applyProfilesToTweets(tweets);
+  return enrichTweets(tweets);
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
