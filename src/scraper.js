@@ -31,7 +31,7 @@ function parseCookieString(raw) {
 
 // ─── Syndication API Helpers (No Auth / High Limits) ─────────────────────────
 
-// 1. Get Avatars from Embed CDN
+// 1. Get Avatars from Official Embed CDN
 function getSyndicationToken(tweetId) {
   return ((Number(tweetId) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
 }
@@ -52,7 +52,6 @@ async function fetchSyndicationProfile(tweetId) {
       username: user.screen_name,
       name: user.name,
       avatar: user.profile_image_url_https?.replace('_normal', ''),
-      // The embed API often omits follower count, so we don't force a default 0 here anymore
       followersCount: user.followers_count, 
       isVerified: user.is_blue_verified || user.verified || false,
     };
@@ -61,23 +60,36 @@ async function fetchSyndicationProfile(tweetId) {
   }
 }
 
-// 2. Get Follower Counts from Follow Button CDN (Batch Request)
+// 2. Get Follower Counts from FixTweet/vxTwitter Public API
 async function fetchSyndicationFollowers(usernames) {
   if (!usernames || usernames.length === 0) return {};
   try {
     const counts = {};
-    // Chunk requests into 50 users at a time to be safe
-    for (let i = 0; i < usernames.length; i += 50) {
-      const chunk = usernames.slice(i, i + 50).join(',');
-      const url = `https://cdn.syndication.twimg.com/widgets/followbutton/info.json?screen_names=${chunk}`;
+    
+    // Process in batches of 5 to respect the free API limits
+    for (let i = 0; i < usernames.length; i += 5) {
+      const chunk = usernames.slice(i, i + 5);
       
-      const res = await fetch(url);
-      if (!res.ok) continue;
-      
-      const data = await res.json();
-      for (const u of data) {
-        counts[u.screen_name.toLowerCase()] = u.followers_count;
-      }
+      await Promise.all(chunk.map(async (uname) => {
+        try {
+          const res = await fetch(`https://api.fxtwitter.com/${uname}`, { 
+            signal: AbortSignal.timeout(5000),
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+          });
+          
+          if (!res.ok) return;
+          const data = await res.json();
+          
+          // FixTweet returns: { code: 200, user: { followers: 12345 } }
+          if (data && data.user && typeof data.user.followers === 'number') {
+            counts[uname.toLowerCase()] = data.user.followers;
+          }
+        } catch (e) {
+          // ignore individual timeouts or network errors
+        }
+      }));
     }
     return counts;
   } catch (err) {
@@ -281,32 +293,34 @@ function formatTweet(tweet) {
 }
 
 async function enrichTweets(tweets) {
-  // 1. Gather all unique usernames for a batch follower-count lookup
   const uniqueUsernames = [...new Set(tweets.map(t => t.username).filter(Boolean))];
-  const followerData = await fetchSyndicationFollowers(uniqueUsernames);
+  
+  // Only query FixTweet for users missing from the cache OR stuck with 0 followers
+  const missingFollowers = uniqueUsernames.filter(uname => {
+    const cached = profileCache.get(`profile:${uname.toLowerCase()}`);
+    return !cached || !cached.followersCount; 
+  });
+
+  const followerData = await fetchSyndicationFollowers(missingFollowers);
 
   return Promise.all(tweets.map(async (tweet) => {
     const unameLower = tweet.username?.toLowerCase();
     const cacheKey = `profile:${unameLower}`;
     let profile = profileCache.get(cacheKey);
 
-    // 2. If not cached, fetch avatar via public CDN using the Tweet ID
+    // If completely uncached, fetch avatar via official CDN using the Tweet ID
     if (!profile && tweet.id) {
       profile = await fetchSyndicationProfile(tweet.id);
-      if (profile) {
-        profileCache.set(cacheKey, profile, PROFILE_CACHE_TTL);
-      }
     }
 
-    // 3. Resolve the highest-priority follower count available
-    // Batch API > Cached Profile > Embedded Tweet Data > 0
-    const realFollowers = followerData[unameLower] 
-                          ?? profile?.followersCount 
-                          ?? tweet.followersCount 
-                          ?? 0;
+    // Resolve the highest-priority follower count available
+    const fetchedCount = followerData[unameLower];
+    const realFollowers = (fetchedCount !== undefined && fetchedCount !== null) 
+                          ? fetchedCount 
+                          : (profile?.followersCount || tweet.followersCount || 0);
 
-    // Save back to cache so we don't keep polling
-    if (profile && realFollowers > 0) {
+    // Save/Update the cache so we don't keep pinging the APIs
+    if (profile) {
       profile.followersCount = realFollowers;
       profileCache.set(cacheKey, profile, PROFILE_CACHE_TTL);
     }
