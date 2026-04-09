@@ -86,37 +86,76 @@ export async function initScraper() {
 
 export const isReady = () => ready;
 
-// ─── Profile image from Twitter page ─────────────────────────────────────────
+// ─── Twitter v1.1 bearer token (public web-client token) ─────────────────────
+// Used alongside session cookies to call the v1.1 REST API.
+const TWITTER_WEB_BEARER =
+  'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
 
-async function fetchProfileImageFromPage(username) {
+/**
+ * Batch-fetch up to 100 Twitter profiles in a single v1.1 users/lookup request.
+ * Uses the authenticated session cookies — no extra auth needed.
+ * Returns a map of { lowercaseUsername → { username, name, avatar, followersCount, isVerified } }.
+ */
+async function batchFetchProfiles(usernames) {
+  if (!usernames.length) return {};
+
   try {
-    const cookies = await scraper.getCookies();
+    const cookies   = await scraper.getCookies();
     const cookieStr = cookies.map(c => `${c.key}=${c.value}`).join('; ');
+    const ct0       = cookies.find(c => c.key === 'ct0')?.value || '';
 
-    const res = await fetch(`https://x.com/${username}/photo`, {
-      headers: {
-        Cookie: cookieStr,
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-      },
-      signal: AbortSignal.timeout(5000),
-    });
+    const profileMap = {};
 
-    if (!res.ok) return null;
-    const html = await res.text();
+    // v1.1 users/lookup accepts up to 100 screen_names per request
+    for (let i = 0; i < usernames.length; i += 100) {
+      const chunk = usernames.slice(i, i + 100);
+      const res = await fetch(
+        `https://api.twitter.com/1.1/users/lookup.json?screen_name=${chunk.join(',')}&include_entities=false`,
+        {
+          headers: {
+            Authorization:          `Bearer ${TWITTER_WEB_BEARER}`,
+            'x-csrf-token':         ct0,
+            Cookie:                 cookieStr,
+            'x-twitter-auth-type':  'OAuth2Session',
+            'x-twitter-active-user':'yes',
+            'User-Agent':           'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            Accept:                 'application/json',
+          },
+          signal: AbortSignal.timeout(8000),
+        }
+      );
 
-    // og:image is the most reliable signal in SSR HTML
-    const ogMatch = html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/);
-    if (ogMatch) return ogMatch[1];
+      if (!res.ok) {
+        console.warn(`[batchFetchProfiles] HTTP ${res.status} — ${await res.text().catch(() => '')}`);
+        continue;
+      }
 
-    // Direct pbs.twimg.com profile_images src as fallback
-    const srcMatch = html.match(/src="(https:\/\/pbs\.twimg\.com\/profile_images\/[^"]+)"/);
-    if (srcMatch) return srcMatch[1];
+      const users = await res.json();
+      if (!Array.isArray(users)) {
+        console.warn('[batchFetchProfiles] unexpected shape:', JSON.stringify(users).slice(0, 200));
+        continue;
+      }
 
-    return null;
-  } catch {
-    return null;
+      for (const user of users) {
+        const key = user.screen_name?.toLowerCase();
+        if (!key) continue;
+        const profile = {
+          username:       user.screen_name,
+          name:           user.name || user.screen_name,
+          // Remove _normal suffix to get original-size image
+          avatar:         user.profile_image_url_https?.replace('_normal', '') || null,
+          followersCount: user.followers_count || 0,
+          isVerified:     user.verified || false,
+        };
+        profileMap[key] = profile;
+        profileCache.set(`profile:${key}`, profile, PROFILE_CACHE_TTL);
+      }
+    }
+
+    return profileMap;
+  } catch (err) {
+    console.warn('[batchFetchProfiles] error:', err.message);
+    return {};
   }
 }
 
@@ -127,42 +166,23 @@ export async function getProfile(username) {
   const cached = profileCache.get(key);
   if (cached) return cached;
 
+  // Primary: scraper's GraphQL UserByScreenName
   try {
     const p = await scraper.getProfile(username);
-
-    let avatarUrl = p.avatar || p.profileImageUrl || p.profile_image_url_https || null;
-
-    // If the scraper didn't return an avatar, try scraping the profile page
-    if (!avatarUrl) {
-      avatarUrl = await fetchProfileImageFromPage(username);
-    }
-
-    const followers = p.followersCount ?? p.followers_count ?? 0;
-
     const formatted = {
-      username:       p.username   || username,
-      name:           p.name       || username,
-      avatar:         avatarUrl,
-      followersCount: followers,
+      username:       p.username       || username,
+      name:           p.name           || username,
+      avatar:         p.avatar         || null,
+      followersCount: p.followersCount || 0,
       isVerified:     p.isBlueVerified || p.isVerified || false,
     };
-
     profileCache.set(key, formatted, PROFILE_CACHE_TTL);
     return formatted;
-  } catch (err) {
-    // API call failed — try the page scrape directly
-    const avatarUrl = await fetchProfileImageFromPage(username);
-    if (avatarUrl) {
-      const formatted = {
-        username,
-        name:           username,
-        avatar:         avatarUrl,
-        followersCount: 0,
-        isVerified:     false,
-      };
-      profileCache.set(key, formatted, PROFILE_CACHE_TTL);
-      return formatted;
-    }
+  } catch {
+    // Fallback: v1.1 batch lookup (single-user batch)
+    const profiles = await batchFetchProfiles([username]);
+    const p = profiles[username.toLowerCase()];
+    if (p) return p; // already cached inside batchFetchProfiles
     throw new Error(`Profile fetch failed for ${username}`);
   }
 }
@@ -182,8 +202,6 @@ function formatTweet(tweet) {
 
   const username = tweet.username || user.screen_name || legacy.screen_name || '';
 
-  // 🔥 SURGICAL FIX: Add unavatar directly to the raw formatter so it never returns null,
-  // even if the enrichment fallback completely times out.
   const embeddedAvatar =
     tweet.profileImageUrl ||
     tweet.avatar ||
@@ -239,71 +257,41 @@ function formatTweet(tweet) {
   };
 }
 
-async function enrichTweets(tweets) {
-  const usernames = [...new Set(tweets.map(t => t.username).filter(Boolean))];
-  const missingUsernames = usernames.filter(u => !profileCache.has(`profile:${u.toLowerCase()}`));
-  
-  // Cap at 10 to dodge rate limits
-  const toFetch = missingUsernames.slice(0, 10);
-
-  const fetchOne = (u) =>
-    Promise.race([
-      getProfile(u),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('profile timeout')), 4_000)),
-    ]);
-
-  await Promise.allSettled(toFetch.map(fetchOne));
-
+function applyProfilesToTweets(tweets) {
   return tweets.map(tweet => {
     const p = profileCache.get(`profile:${tweet.username?.toLowerCase()}`) || {};
     return {
       ...tweet,
-      profileImage:   p.avatar || tweet.profileImage || null,
-      displayName:    p.name || tweet.displayName || tweet.username,
+      profileImage:   p.avatar         || tweet.profileImage || null,
+      displayName:    p.name           || tweet.displayName  || tweet.username,
       followersCount: p.followersCount ?? tweet.followersCount ?? 0,
-      isVerified:     p.isVerified || tweet.isVerified || false,
+      isVerified:     p.isVerified     || tweet.isVerified   || false,
     };
   });
 }
 
-async function enrichTweetsBatched(tweets, batchSize = 5) {
-  const usernames = [...new Set(tweets.map(t => t.username).filter(Boolean))];
+async function enrichTweets(tweets) {
+  const usernames       = [...new Set(tweets.map(t => t.username).filter(Boolean))];
   const missingUsernames = usernames.filter(u => !profileCache.has(`profile:${u.toLowerCase()}`));
 
-  // 🔴 FIX: We no longer slice/cap the list to 10. 
-  // Since this runs in the background, we have time to fetch ALL missing profiles safely.
-  const toFetch = missingUsernames;
-
-  const fetchOne = async (u) => {
-    try {
-      return await Promise.race([
-        getProfile(u),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('profile timeout')), 4_000)),
-      ]);
-    } catch (e) {
-      return null;
-    }
-  };
-
-  // Loop through all missing profiles in small batches of 5
-  for (let i = 0; i < toFetch.length; i += batchSize) {
-    const batch = toFetch.slice(i, i + batchSize);
-    await Promise.allSettled(batch.map(fetchOne));
-    
-    // Add a tiny 500ms pause between batches so Twitter doesn't block the scraper
-    await new Promise(resolve => setTimeout(resolve, 500));
+  if (missingUsernames.length > 0) {
+    // One batch request for ALL missing users (up to 100 per call)
+    await batchFetchProfiles(missingUsernames);
   }
 
-  return tweets.map(tweet => {
-    const p = profileCache.get(`profile:${tweet.username?.toLowerCase()}`) || {};
-    return {
-      ...tweet,
-      profileImage:   p.avatar || tweet.profileImage || null,
-      displayName:    p.name || tweet.displayName || tweet.username,
-      followersCount: p.followersCount ?? tweet.followersCount ?? 0,
-      isVerified:     p.isVerified || tweet.isVerified || false,
-    };
-  });
+  return applyProfilesToTweets(tweets);
+}
+
+async function enrichTweetsBatched(tweets) {
+  const usernames       = [...new Set(tweets.map(t => t.username).filter(Boolean))];
+  const missingUsernames = usernames.filter(u => !profileCache.has(`profile:${u.toLowerCase()}`));
+
+  if (missingUsernames.length > 0) {
+    // Batch v1.1 lookup handles up to 100 per call — no looping needed for typical firehose sizes
+    await batchFetchProfiles(missingUsernames);
+  }
+
+  return applyProfilesToTweets(tweets);
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
